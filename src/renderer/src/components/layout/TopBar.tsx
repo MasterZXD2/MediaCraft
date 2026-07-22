@@ -8,6 +8,8 @@ export function TopBar(): JSX.Element {
   const isProcessing = useMediaStore((state) => state.isProcessing)
   const progressCurrent = useMediaStore((state) => state.progressCurrent)
   const progressTotal = useMediaStore((state) => state.progressTotal)
+  const itemCount = useMediaStore((state) => state.itemCount)
+  const totalSize = useMediaStore((state) => state.totalSize)
   const setDatasetRoot = useMediaStore((state) => state.setDatasetRoot)
   const loadDirectory = useMediaStore((state) => state.loadDirectory)
 
@@ -43,7 +45,14 @@ export function TopBar(): JSX.Element {
         ) : (
           <FolderOpen className="h-3.5 w-3.5 shrink-0 text-primary" />
         )}
-        <span className="truncate">{datasetRoot || 'Select Folder'}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate">{datasetRoot || 'Select Folder'}</span>
+          <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground/80">
+            {datasetRoot
+              ? `${itemCount.toLocaleString()} ${itemCount === 1 ? 'file' : 'files'} - ${formatBytes(totalSize)}`
+              : 'Choose a local media dataset'}
+          </span>
+        </span>
       </button>
 
       <div className="ml-auto hidden w-44 items-center gap-3 lg:flex">
@@ -71,4 +80,12 @@ export function TopBar(): JSX.Element {
       </Button>
     </header>
   )
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const value = bytes / 1024 ** unitIndex
+  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
 }

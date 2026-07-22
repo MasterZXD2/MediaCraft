@@ -1,25 +1,70 @@
-import { useEffect, useState } from 'react'
-import { FileImage, Film, FolderOpen, Grid2X2, List, LoaderCircle, Search, SlidersHorizontal } from 'lucide-react'
-import type { MediaFile } from '../../../../shared/media'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { FolderOpen, Grid2X2, List, LoaderCircle, Search, SlidersHorizontal } from 'lucide-react'
+import { MediaCard } from '@/components/curate/MediaCard'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { useMediaStore } from '@/store/mediaStore'
+import { selectActiveMediaCount, selectActiveMediaIds, useMediaStore } from '@/store/mediaStore'
+
+const GRID_PADDING = 16
+const GRID_GAP = 12
+const MIN_CARD_WIDTH = 180
+const MAX_COLUMNS = 5
+const CARD_DETAILS_HEIGHT = 56
 
 export function MainArea(): JSX.Element {
-  const mediaFiles = useMediaStore((state) => state.mediaFiles)
+  const allIds = useMediaStore(selectActiveMediaIds)
+  const itemCount = useMediaStore(selectActiveMediaCount)
+  const activeFilter = useMediaStore((state) => state.activeFilter)
+  const totalSize = useMediaStore((state) => state.totalSize)
+  const totalTrashSize = useMediaStore((state) => state.totalTrashSize)
   const datasetRoot = useMediaStore((state) => state.datasetRoot)
   const isLoading = useMediaStore((state) => state.isLoading)
   const error = useMediaStore((state) => state.error)
-  const totalSize = mediaFiles.reduce((sum, file) => sum + file.size, 0)
+  const scrollParentRef = useRef<HTMLDivElement>(null)
+  const containerWidth = useElementWidth(scrollParentRef)
+  const contentWidth = Math.max(0, containerWidth - GRID_PADDING * 2)
+  const columnCount = useMemo(() => {
+    if (contentWidth === 0) return 1
+    const fittingColumns = Math.floor((contentWidth + GRID_GAP) / (MIN_CARD_WIDTH + GRID_GAP))
+    return Math.max(1, Math.min(MAX_COLUMNS, fittingColumns))
+  }, [contentWidth])
+  const cardWidth = Math.max(0, (contentWidth - GRID_GAP * (columnCount - 1)) / columnCount)
+  const cardHeight = cardWidth * 0.75 + CARD_DETAILS_HEIGHT
+  const rowStride = cardHeight + GRID_GAP
+  const getItemKey = useCallback((index: number) => allIds[index] ?? index, [allIds])
+
+  const virtualizer = useVirtualizer({
+    count: itemCount,
+    getScrollElement: () => scrollParentRef.current,
+    estimateSize: () => rowStride,
+    getItemKey,
+    lanes: columnCount,
+    overscan: 4
+  })
+  const virtualItems = virtualizer.getVirtualItems()
+  const visibleIds = useMemo(
+    () => virtualItems.map((virtualItem) => allIds[virtualItem.index]).filter((id): id is string => Boolean(id)),
+    [virtualItems, allIds]
+  )
+
+  useEffect(() => {
+    window.api.setVisibleMediaIds(visibleIds)
+  }, [visibleIds])
+
+  useLayoutEffect(() => {
+    virtualizer.measure()
+  }, [cardWidth, columnCount, virtualizer])
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-4">
         <div>
-          <h1 className="text-sm font-semibold">All Media</h1>
+          <h1 className="text-sm font-semibold">{filterLabels[activeFilter]}</h1>
           <p className="text-[10px] text-muted-foreground">
-            {mediaFiles.length} {mediaFiles.length === 1 ? 'item' : 'items'} · {formatBytes(totalSize)}
+            {itemCount.toLocaleString()} {itemCount === 1 ? 'item' : 'items'}
+            {activeFilter === 'all' ? ` - ${formatBytes(totalSize)}` : ''}
+            {activeFilter === 'trash' ? ` - ${formatBytes(totalTrashSize)}` : ''}
           </p>
         </div>
         <div className="relative ml-auto hidden w-48 sm:block xl:w-64">
@@ -39,72 +84,95 @@ export function MainArea(): JSX.Element {
         </div>
       </div>
 
-      <ScrollArea className="min-h-0 flex-1">
-        {isLoading ? (
+      <div ref={scrollParentRef} className="min-h-0 flex-1 overflow-auto">
+        {isLoading && itemCount === 0 ? (
           <StatusPanel icon={LoaderCircle} title="Scanning folder" message="Finding images and videos..." spinning />
         ) : error ? (
           <StatusPanel icon={FolderOpen} title="Scan failed" message={error} tone="error" />
-        ) : mediaFiles.length === 0 ? (
+        ) : itemCount === 0 ? (
           <StatusPanel
             icon={FolderOpen}
-            title={datasetRoot ? 'No supported media found' : 'Select a media folder'}
+            title={datasetRoot
+              ? activeFilter === 'all'
+                ? 'No supported media found'
+                : `No ${filterLabels[activeFilter].toLowerCase()} found`
+              : 'Select a media folder'}
             message={
               datasetRoot
-                ? 'This folder contains no supported JPG, PNG, WebP, MP4, MKV, MOV, or WebM files.'
+                ? activeFilter === 'all'
+                  ? 'This folder contains no supported JPG, PNG, WebP, MP4, MKV, MOV, or WebM files.'
+                  : activeFilter === 'trash'
+                    ? 'Soft-trashed media from this dataset will appear here.'
+                    : 'Choose another filter or scan a different media folder.'
                 : 'Use Select Folder in the top bar to scan your local media library.'
             }
           />
         ) : (
-          <div className="grid grid-cols-2 gap-3 p-4 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-            {mediaFiles.map((file) => (
-              <MediaCard key={file.path} file={file} />
-            ))}
+          <div
+            className="relative m-4"
+            style={{ width: contentWidth, height: virtualizer.getTotalSize() }}
+          >
+            {virtualItems.map((virtualItem) => {
+              const id = allIds[virtualItem.index]
+              if (!id) return null
+
+              return (
+                <div
+                  key={virtualItem.key}
+                  className="absolute left-0 top-0"
+                  style={{
+                    width: cardWidth,
+                    height: Math.max(1, virtualItem.size - GRID_GAP),
+                    transform: `translate3d(${virtualItem.lane * (cardWidth + GRID_GAP)}px, ${virtualItem.start}px, 0)`
+                  }}
+                >
+                  <MediaCard id={id} />
+                </div>
+              )
+            })}
           </div>
         )}
-      </ScrollArea>
+      </div>
 
       <footer className="flex h-8 shrink-0 items-center border-t border-border bg-card/35 px-4 text-[10px] text-muted-foreground">
-        <span>{mediaFiles.length} items loaded</span>
+        <span>{itemCount.toLocaleString()} items shown</span>
         <span className="ml-auto max-w-[55%] truncate" title={datasetRoot}>{datasetRoot || 'No folder selected'}</span>
       </footer>
     </main>
   )
 }
 
-function MediaCard({ file }: { file: MediaFile }): JSX.Element {
-  const [previewFailed, setPreviewFailed] = useState(false)
-  const Icon = file.type === 'video' ? Film : FileImage
+const filterLabels = {
+  all: 'All Media',
+  images: 'Images',
+  videos: 'Videos',
+  duplicates: 'Duplicates',
+  trash: 'Trash'
+} as const
 
-  useEffect(() => setPreviewFailed(false), [file.thumbnailUrl])
+function useElementWidth(ref: RefObject<HTMLElement | null>): number {
+  const [width, setWidth] = useState(0)
 
-  return (
-    <article className="group min-w-0 overflow-hidden rounded-lg border border-border bg-card/55 transition-all hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-xl hover:shadow-black/20">
-      <div className="relative aspect-[4/3] overflow-hidden bg-gradient-to-br from-slate-800 via-slate-900 to-zinc-950">
-        {file.thumbnailUrl && !previewFailed ? (
-          <img
-            src={file.thumbnailUrl}
-            alt={file.filename}
-            loading="lazy"
-            decoding="async"
-            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-            onError={() => setPreviewFailed(true)}
-          />
-        ) : (
-          <Icon className="absolute left-1/2 top-1/2 h-9 w-9 -translate-x-1/2 -translate-y-1/2 text-white/25" />
-        )}
-        <span className="absolute bottom-2 left-2 rounded bg-black/60 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-white/80 backdrop-blur-sm">
-          {file.type}
-        </span>
-      </div>
-      <div className="p-2.5">
-        <p className="truncate text-xs font-medium" title={file.filename}>{file.filename}</p>
-        <div className="mt-1.5 flex items-center text-[9px] uppercase tracking-wider text-muted-foreground">
-          <span>{file.type}</span>
-          <span className="ml-auto font-mono normal-case tracking-normal">{formatBytes(file.size)}</span>
-        </div>
-      </div>
-    </article>
-  )
+  useLayoutEffect(() => {
+    const element = ref.current
+    if (!element) return
+
+    const updateWidth = (nextWidth: number): void => {
+      const roundedWidth = Math.round(nextWidth)
+      setWidth((currentWidth) => currentWidth === roundedWidth ? currentWidth : roundedWidth)
+    }
+
+    updateWidth(element.clientWidth)
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry) updateWidth(entry.contentRect.width)
+    })
+    observer.observe(element)
+
+    return () => observer.disconnect()
+  }, [ref])
+
+  return width
 }
 
 function StatusPanel({

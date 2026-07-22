@@ -27,11 +27,49 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
       height INTEGER,
       duration REAL,
       fps REAL,
-      last_modified INTEGER NOT NULL
+      last_modified INTEGER NOT NULL,
+      scan_generation INTEGER NOT NULL DEFAULT 0,
+      perceptual_hash TEXT,
+      duplicate_group_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'trash'))
     );
+  `)
 
+  const mediaFileColumns = database.pragma('table_info(media_files)') as Array<{ name: string }>
+  if (!mediaFileColumns.some((column) => column.name === 'scan_generation')) {
+    database.exec(`
+      ALTER TABLE media_files
+      ADD COLUMN scan_generation INTEGER NOT NULL DEFAULT 0;
+    `)
+  }
+  if (!mediaFileColumns.some((column) => column.name === 'perceptual_hash')) {
+    database.exec('ALTER TABLE media_files ADD COLUMN perceptual_hash TEXT;')
+  }
+  if (!mediaFileColumns.some((column) => column.name === 'duplicate_group_id')) {
+    database.exec('ALTER TABLE media_files ADD COLUMN duplicate_group_id TEXT;')
+  }
+  if (!mediaFileColumns.some((column) => column.name === 'status')) {
+    database.exec("ALTER TABLE media_files ADD COLUMN status TEXT NOT NULL DEFAULT 'active';")
+  }
+
+  database.exec(`
     CREATE INDEX IF NOT EXISTS idx_media_files_folder_path
       ON media_files (folder_path);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_folder_generation
+      ON media_files (folder_path, scan_generation);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_folder_size
+      ON media_files (folder_path, type, size_bytes);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_folder_dimensions
+      ON media_files (folder_path, type, width, height, duration);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_duplicate_group
+      ON media_files (folder_path, duplicate_group_id);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_folder_status
+      ON media_files (folder_path, status);
   `)
 
   return database

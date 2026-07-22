@@ -1,24 +1,33 @@
-import { createHash } from 'node:crypto'
-import { access, mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { access, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import ffmpeg from 'fluent-ffmpeg'
 import sharp from 'sharp'
 import type { MediaType } from '../../shared/media'
+import { extractVideoFrame, FfmpegError } from './ffmpeg'
 
 let cacheDirectory: string | null = null
+
+export interface ThumbnailGenerationOptions {
+  signal?: AbortSignal
+}
 
 export async function initializeThumbnailCache(directory: string): Promise<void> {
   cacheDirectory = resolve(directory)
   await mkdir(cacheDirectory, { recursive: true })
 }
 
-export async function generateThumbnail(sourcePath: string, type: MediaType): Promise<string | null> {
+export async function generateThumbnail(
+  sourcePath: string,
+  type: MediaType,
+  options: ThumbnailGenerationOptions = {}
+): Promise<string | null> {
   if (!cacheDirectory) {
     console.error('Thumbnail cache has not been initialized.')
     return null
   }
 
   let thumbnailPath = ''
+  let temporaryPath = ''
   let failureMarkerPath = ''
   let cachePermanentFailure = false
 
@@ -32,7 +41,8 @@ export async function generateThumbnail(sourcePath: string, type: MediaType): Pr
     failureMarkerPath = resolve(cacheDirectory, `${cacheKey}.failed`)
 
     try {
-      await access(thumbnailPath)
+      const cachedStats = await stat(thumbnailPath)
+      if (cachedStats.size <= 0) throw new Error('Empty thumbnail cache entry.')
       return thumbnailPath
     } catch {
       // Cache miss; generate the thumbnail below.
@@ -45,19 +55,31 @@ export async function generateThumbnail(sourcePath: string, type: MediaType): Pr
       // No known failure for this exact source version.
     }
 
+    temporaryPath = `${thumbnailPath}.${process.pid}.${randomUUID()}.tmp`
     if (type === 'image') {
-      await sharp(absoluteSourcePath)
-        .rotate()
-        .resize(256, 256, { fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: 72, mozjpeg: true })
-        .toFile(thumbnailPath)
+      try {
+        await sharp(absoluteSourcePath)
+          .rotate()
+          .resize(256, 256, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 72, mozjpeg: true })
+          .toFile(temporaryPath)
+      } catch (error) {
+        cachePermanentFailure = isSharpDecodeFailure(error)
+        throw error
+      }
     } else {
       try {
-        await extractVideoFrame(absoluteSourcePath, thumbnailPath, 1)
+        await extractVideoFrame(absoluteSourcePath, temporaryPath, 1, {
+          signal: options.signal,
+          timeoutMs: FFMPEG_TIMEOUT_MS
+        })
       } catch (firstError) {
-        await rm(thumbnailPath, { force: true })
+        await rm(temporaryPath, { force: true })
         try {
-          await extractVideoFrame(absoluteSourcePath, thumbnailPath, 0)
+          await extractVideoFrame(absoluteSourcePath, temporaryPath, 0, {
+            signal: options.signal,
+            timeoutMs: FFMPEG_TIMEOUT_MS
+          })
         } catch (fallbackError) {
           cachePermanentFailure = isFfmpegDecodeFailure(firstError) && isFfmpegDecodeFailure(fallbackError)
           throw fallbackError
@@ -65,14 +87,17 @@ export async function generateThumbnail(sourcePath: string, type: MediaType): Pr
       }
     }
 
-    await access(thumbnailPath)
+    const generatedStats = await stat(temporaryPath)
+    if (generatedStats.size <= 0) throw new Error('Thumbnail generation produced an empty file.')
+    await publishAtomically(temporaryPath, thumbnailPath)
+    temporaryPath = ''
     return thumbnailPath
   } catch (error) {
-    if (thumbnailPath) await rm(thumbnailPath, { force: true }).catch(() => undefined)
+    if (temporaryPath) await rm(temporaryPath, { force: true }).catch(() => undefined)
 
     if (cachePermanentFailure && failureMarkerPath) {
       await writeFile(failureMarkerPath, getErrorMessage(error), 'utf8').catch(() => undefined)
-      console.warn(`Thumbnail skipped; video has no decodable frame: ${sourcePath}`)
+      console.warn(`Thumbnail skipped; media is not decodable: ${sourcePath}`)
     } else {
       console.warn(`Thumbnail unavailable for ${sourcePath}: ${getErrorMessage(error)}`)
     }
@@ -81,7 +106,18 @@ export async function generateThumbnail(sourcePath: string, type: MediaType): Pr
 }
 
 function isFfmpegDecodeFailure(error: unknown): boolean {
-  return error instanceof Error && error.message.includes('ffmpeg exited with code')
+  return error instanceof FfmpegError && error.reason === 'exit'
+}
+
+function isSharpDecodeFailure(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase()
+  return (
+    message.includes('unsupported image format') ||
+    message.includes('corrupt') ||
+    message.includes('invalid') ||
+    message.includes('premature end') ||
+    message.includes('unexpected end')
+  )
 }
 
 function getErrorMessage(error: unknown): string {
@@ -91,24 +127,19 @@ function getErrorMessage(error: unknown): string {
 
 const FFMPEG_TIMEOUT_MS = 30_000
 
-function extractVideoFrame(sourcePath: string, outputPath: string, timestampSeconds: number): Promise<void> {
-  return new Promise((resolveFrame, rejectFrame) => {
-    const cmd = ffmpeg(sourcePath)
-      .seekInput(timestampSeconds)
-      .frames(1)
-      .videoFilters('scale=256:256:force_original_aspect_ratio=decrease')
-      .outputOptions(['-q:v 5', '-an'])
-      .format('image2')
-      .output(outputPath)
-
-    const timer = setTimeout(() => {
-      try { cmd.kill('SIGKILL') } catch {}
-      rejectFrame(new Error(`ffmpeg timed out after ${FFMPEG_TIMEOUT_MS}ms: ${sourcePath}`))
-    }, FFMPEG_TIMEOUT_MS)
-
-    cmd
-      .on('end', () => { clearTimeout(timer); resolveFrame() })
-      .on('error', (err) => { clearTimeout(timer); rejectFrame(err) })
-      .run()
-  })
+async function publishAtomically(temporaryPath: string, thumbnailPath: string): Promise<void> {
+  try {
+    await rename(temporaryPath, thumbnailPath)
+  } catch (error) {
+    try {
+      const existingStats = await stat(thumbnailPath)
+      if (existingStats.size > 0) {
+        await rm(temporaryPath, { force: true })
+        return
+      }
+    } catch {
+      // The final path does not exist; preserve the original rename error.
+    }
+    throw error
+  }
 }

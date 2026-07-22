@@ -1,17 +1,25 @@
 import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell, type WebContents } from 'electron'
 import { join, normalize, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { scanDirectory } from './ipc/scanner'
-import { generateThumbnail, initializeThumbnailCache } from './lib/thumbnail'
-import { closeDatabase, initializeDatabase } from './db'
+import { CatalogWorkerCoordinator } from './ipc/scanner'
+import { DuplicateIpcController } from './ipc/duplicates'
+import { CleanupIpcController } from './ipc/cleanup'
+import { PriorityMediaScheduler } from './lib/scheduler'
+import { initializeThumbnailCache } from './lib/thumbnail'
+import type { CatalogStreamEvent } from '../shared/catalog'
 import type { MediaFile } from '../shared/media'
 
 const MEDIA_PROTOCOL = 'mediacraft-media'
 const selectedDirectories = new Set<string>()
 const allowedSourceFiles = new Set<string>()
 const allowedThumbnailFiles = new Set<string>()
+const thumbnailTargets = new Map<number, WebContents>()
 let thumbnailRunId = 0
-const scanProgressMap = new Map<number, { processed: number; total: number }>()
+let catalogWorker: CatalogWorkerCoordinator | null = null
+let duplicateIpc: DuplicateIpcController | null = null
+let cleanupIpc: CleanupIpcController | null = null
+let shutdownStarted = false
+let shutdownFinished = false
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -25,7 +33,21 @@ function normalizeForComparison(filePath: string): string {
   return process.platform === 'win32' ? normalizedPath.toLowerCase() : normalizedPath
 }
 
-function registerIpcHandlers(): void {
+const thumbnailScheduler = new PriorityMediaScheduler({
+  onComplete: ({ job, thumbnailPath }) => {
+    const webContents = thumbnailTargets.get(job.generation)
+    if (!thumbnailPath || !webContents || webContents.isDestroyed() || job.generation !== thumbnailRunId) return
+    allowedThumbnailFiles.add(normalizeForComparison(thumbnailPath))
+    webContents.send('thumbnail-ready', { filePath: job.sourcePath, thumbnailPath })
+  },
+  onProgress: ({ generation, current, total }) => {
+    const webContents = thumbnailTargets.get(generation)
+    if (!webContents || webContents.isDestroyed() || generation !== thumbnailRunId) return
+    webContents.send('scan-progress', { current, total })
+  }
+})
+
+function registerIpcHandlers(coordinator: CatalogWorkerCoordinator): void {
   ipcMain.handle('select-folder', async (event) => {
     const parentWindow = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
@@ -43,78 +65,80 @@ function registerIpcHandlers(): void {
     return selectedPath
   })
 
-  ipcMain.handle('scan-directory', async (event, targetPath: unknown) => {
+  ipcMain.handle('scan-directory', (event, targetPath: unknown) => {
     if (typeof targetPath !== 'string') throw new Error('Invalid directory path.')
 
-    const runId = ++thumbnailRunId
-    scanProgressMap.delete(runId - 1)
-    allowedSourceFiles.clear()
-    allowedThumbnailFiles.clear()
-
-    const normalizedTarget = normalizeForComparison(targetPath)
-    if (!selectedDirectories.has(normalizedTarget)) {
+    const folderPath = resolve(targetPath)
+    if (!selectedDirectories.has(normalizeForComparison(folderPath))) {
       throw new Error('Choose this directory with the folder picker before scanning it.')
     }
 
-    let initialFilePaths = new Set<string>()
-    const files = await scanDirectory(targetPath, (synchronizedFiles) => {
+    if (thumbnailRunId > 0) thumbnailScheduler.cancelGeneration(thumbnailRunId)
+    const runId = ++thumbnailRunId
+    thumbnailTargets.clear()
+    thumbnailTargets.set(runId, event.sender)
+    allowedSourceFiles.clear()
+    allowedThumbnailFiles.clear()
+    const queuedThumbnailIds = new Set<string>()
+
+    return coordinator.startScan(folderPath, (catalogEvent) => {
       if (runId !== thumbnailRunId || event.sender.isDestroyed()) return
-
-      allowedSourceFiles.clear()
-      for (const file of synchronizedFiles) allowedSourceFiles.add(normalizeForComparison(file.path))
-      event.sender.send('directory-sync-complete', {
-        folderPath: resolve(targetPath),
-        files: synchronizedFiles
-      })
-
-      const newFiles = synchronizedFiles.filter((file) => !initialFilePaths.has(file.path))
-      queueThumbnails(newFiles, event.sender, runId)
+      handleCatalogEvent(catalogEvent, event.sender, runId, queuedThumbnailIds)
     })
-    initialFilePaths = new Set(files.map((file) => file.path))
-    for (const file of files) allowedSourceFiles.add(normalizeForComparison(file.path))
-    queueThumbnails(files, event.sender, runId)
-    return files
+  })
+
+  ipcMain.on('visible-media-ids', (_event, ids: unknown) => {
+    if (!Array.isArray(ids)) return
+    const visibleIds = ids
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+      .slice(0, 500)
+    thumbnailScheduler.updateVisibleIds(visibleIds)
   })
 }
 
-function queueThumbnails(files: MediaFile[], webContents: WebContents, runId: number): void {
-  if (files.length === 0) return
+function handleCatalogEvent(
+  event: CatalogStreamEvent,
+  webContents: WebContents,
+  runId: number,
+  queuedThumbnailIds: Set<string>
+): void {
+  if (event.type === 'reset') {
+    allowedSourceFiles.clear()
+    allowedThumbnailFiles.clear()
+    queuedThumbnailIds.clear()
+    webContents.send('catalog-event', event)
+    return
+  }
 
-  const existing = scanProgressMap.get(runId)
-  const progress = existing ?? { processed: 0, total: 0 }
-  progress.total += files.length
-  if (!existing) scanProgressMap.set(runId, progress)
-
-  setImmediate(() => {
-    if (!webContents.isDestroyed()) {
-      webContents.send('scan-progress', { current: progress.processed, total: progress.total })
-    }
-
-    let nextIndex = 0
-
-    const worker = async (): Promise<void> => {
-      while (runId === thumbnailRunId && !webContents.isDestroyed()) {
-        const fileIndex = nextIndex++
-        if (fileIndex >= files.length) return
-
-        const file = files[fileIndex]
-        const thumbnailPath = await generateThumbnail(file.path, file.type)
-        if (runId !== thumbnailRunId || webContents.isDestroyed()) return
-
-        progress.processed++
-        webContents.send('scan-progress', { current: progress.processed, total: progress.total })
-
-        if (!thumbnailPath) continue
-        allowedThumbnailFiles.add(normalizeForComparison(thumbnailPath))
-        webContents.send('thumbnail-ready', { filePath: file.path, thumbnailPath })
+  if (event.type === 'chunk' || event.type === 'trash-chunk') {
+    const thumbnailFiles: MediaFile[] = []
+    for (const file of event.files) {
+      allowedSourceFiles.add(normalizeForComparison(file.path))
+      if (!queuedThumbnailIds.has(file.path)) {
+        queuedThumbnailIds.add(file.path)
+        thumbnailFiles.push(file)
       }
     }
 
-    const workerCount = Math.min(4, files.length)
-    void Promise.all(Array.from({ length: workerCount }, () => worker())).catch((error) => {
-      console.warn('Thumbnail queue stopped unexpectedly:', error)
-    })
-  })
+    webContents.send('catalog-event', event)
+    for (const file of thumbnailFiles) {
+      thumbnailScheduler.enqueue({
+        id: file.path,
+        sourcePath: file.path,
+        type: file.type,
+        generation: runId
+      })
+    }
+    const progress = thumbnailScheduler.progressFor(runId)
+    webContents.send('scan-progress', { current: progress.current, total: progress.total })
+    return
+  }
+
+  if (event.type === 'remove') {
+    for (const id of event.ids) allowedSourceFiles.delete(normalizeForComparison(id))
+  }
+
+  webContents.send('catalog-event', event)
 }
 
 function registerMediaProtocol(): void {
@@ -155,7 +179,7 @@ function createWindow(): void {
 
   window.on('ready-to-show', () => window.show())
   window.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url)
+    if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
     return { action: 'deny' }
   })
 
@@ -169,15 +193,34 @@ function createWindow(): void {
 app.whenReady().then(async () => {
   const databasePath = join(app.getPath('userData'), 'mediacraft.db')
   const thumbnailCacheDirectory = join(app.getPath('userData'), 'MediaCraft_Thumbnails')
-  initializeDatabase(databasePath)
+
   try {
-    await initializeThumbnailCache(thumbnailCacheDirectory)
+    catalogWorker = new CatalogWorkerCoordinator(databasePath)
+    await Promise.all([
+      catalogWorker.ready(),
+      initializeThumbnailCache(thumbnailCacheDirectory)
+    ])
   } catch (error) {
-    console.error('Unable to initialize the thumbnail cache:', error)
+    const message = error instanceof Error ? error.message : String(error)
+    dialog.showErrorBox('MediaCraft could not start', `Catalog initialization failed: ${message}`)
+    app.quit()
+    return
   }
 
   registerMediaProtocol()
-  registerIpcHandlers()
+  registerIpcHandlers(catalogWorker)
+  duplicateIpc = new DuplicateIpcController(
+    catalogWorker,
+    (folderPath) => selectedDirectories.has(normalizeForComparison(folderPath))
+  )
+  duplicateIpc.register()
+  cleanupIpc = new CleanupIpcController(
+    catalogWorker,
+    (filePath) => allowedSourceFiles.has(normalizeForComparison(filePath)),
+    (folderPath) => selectedDirectories.has(normalizeForComparison(folderPath)),
+    (filePath) => allowedSourceFiles.delete(normalizeForComparison(filePath))
+  )
+  cleanupIpc.register()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -188,8 +231,22 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('will-quit', () => {
+app.on('before-quit', (event) => {
+  if (!catalogWorker || shutdownFinished) return
+  event.preventDefault()
+  if (shutdownStarted) return
+
+  shutdownStarted = true
   ipcMain.removeHandler('select-folder')
   ipcMain.removeHandler('scan-directory')
-  closeDatabase()
+  ipcMain.removeAllListeners('visible-media-ids')
+  cleanupIpc?.shutdown()
+  void Promise.all([
+    catalogWorker.shutdown(),
+    thumbnailScheduler.shutdown(),
+    duplicateIpc?.shutdown()
+  ]).finally(() => {
+    shutdownFinished = true
+    app.quit()
+  })
 })

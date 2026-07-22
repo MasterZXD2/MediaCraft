@@ -10,6 +10,7 @@ export interface MediaFile {
   duration: number | null
   fps: number | null
   lastModified: number
+  duplicateGroupId?: string | null
   previewUrl: string
   thumbnailUrl?: string
 }
@@ -17,11 +18,6 @@ export interface MediaFile {
 export interface ThumbnailReadyData {
   filePath: string
   thumbnailPath: string
-}
-
-export interface DirectorySyncData {
-  folderPath: string
-  files: MediaFile[]
 }
 
 export interface ScanProgressData {
