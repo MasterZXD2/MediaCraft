@@ -11,6 +11,7 @@ const selectedDirectories = new Set<string>()
 const allowedSourceFiles = new Set<string>()
 const allowedThumbnailFiles = new Set<string>()
 let thumbnailRunId = 0
+const scanProgressMap = new Map<number, { processed: number; total: number }>()
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -46,6 +47,7 @@ function registerIpcHandlers(): void {
     if (typeof targetPath !== 'string') throw new Error('Invalid directory path.')
 
     const runId = ++thumbnailRunId
+    scanProgressMap.delete(runId - 1)
     allowedSourceFiles.clear()
     allowedThumbnailFiles.clear()
 
@@ -76,7 +78,18 @@ function registerIpcHandlers(): void {
 }
 
 function queueThumbnails(files: MediaFile[], webContents: WebContents, runId: number): void {
+  if (files.length === 0) return
+
+  const existing = scanProgressMap.get(runId)
+  const progress = existing ?? { processed: 0, total: 0 }
+  progress.total += files.length
+  if (!existing) scanProgressMap.set(runId, progress)
+
   setImmediate(() => {
+    if (!webContents.isDestroyed()) {
+      webContents.send('scan-progress', { current: progress.processed, total: progress.total })
+    }
+
     let nextIndex = 0
 
     const worker = async (): Promise<void> => {
@@ -86,14 +99,18 @@ function queueThumbnails(files: MediaFile[], webContents: WebContents, runId: nu
 
         const file = files[fileIndex]
         const thumbnailPath = await generateThumbnail(file.path, file.type)
-        if (!thumbnailPath || runId !== thumbnailRunId || webContents.isDestroyed()) continue
+        if (runId !== thumbnailRunId || webContents.isDestroyed()) return
 
+        progress.processed++
+        webContents.send('scan-progress', { current: progress.processed, total: progress.total })
+
+        if (!thumbnailPath) continue
         allowedThumbnailFiles.add(normalizeForComparison(thumbnailPath))
         webContents.send('thumbnail-ready', { filePath: file.path, thumbnailPath })
       }
     }
 
-    const workerCount = Math.min(2, files.length)
+    const workerCount = Math.min(4, files.length)
     void Promise.all(Array.from({ length: workerCount }, () => worker())).catch((error) => {
       console.warn('Thumbnail queue stopped unexpectedly:', error)
     })

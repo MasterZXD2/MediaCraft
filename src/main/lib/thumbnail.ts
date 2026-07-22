@@ -89,17 +89,26 @@ function getErrorMessage(error: unknown): string {
   return error.message.split(/\r?\n/, 1)[0] || error.name
 }
 
+const FFMPEG_TIMEOUT_MS = 30_000
+
 function extractVideoFrame(sourcePath: string, outputPath: string, timestampSeconds: number): Promise<void> {
   return new Promise((resolveFrame, rejectFrame) => {
-    ffmpeg(sourcePath)
+    const cmd = ffmpeg(sourcePath)
       .seekInput(timestampSeconds)
       .frames(1)
       .videoFilters('scale=256:256:force_original_aspect_ratio=decrease')
       .outputOptions(['-q:v 5', '-an'])
       .format('image2')
       .output(outputPath)
-      .on('end', () => resolveFrame())
-      .on('error', rejectFrame)
+
+    const timer = setTimeout(() => {
+      try { cmd.kill('SIGKILL') } catch {}
+      rejectFrame(new Error(`ffmpeg timed out after ${FFMPEG_TIMEOUT_MS}ms: ${sourcePath}`))
+    }, FFMPEG_TIMEOUT_MS)
+
+    cmd
+      .on('end', () => { clearTimeout(timer); resolveFrame() })
+      .on('error', (err) => { clearTimeout(timer); rejectFrame(err) })
       .run()
   })
 }

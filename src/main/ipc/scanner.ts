@@ -48,11 +48,14 @@ export async function scanDirectory(
   return syncDirectory(rootPath)
 }
 
+const CHUNK_SIZE = 100
+
 async function syncDirectory(rootPath: string): Promise<MediaFile[]> {
   const rootStats = await stat(rootPath)
   if (!rootStats.isDirectory()) throw new Error('The selected path is not a directory.')
 
-  const discoveredFiles: MediaFileData[] = []
+  const allFilePaths: string[] = []
+  let chunk: MediaFileData[] = []
   const pendingDirectories = [rootPath]
 
   while (pendingDirectories.length > 0) {
@@ -79,7 +82,8 @@ async function syncDirectory(rootPath: string): Promise<MediaFile[]> {
 
       try {
         const fileStats = await stat(entryPath)
-        discoveredFiles.push({
+        allFilePaths.push(entryPath)
+        chunk.push({
           folderPath: rootPath,
           filePath: entryPath,
           filename: entry.name,
@@ -91,14 +95,18 @@ async function syncDirectory(rootPath: string): Promise<MediaFile[]> {
           fps: null,
           lastModified: Math.trunc(fileStats.mtimeMs)
         })
+        if (chunk.length >= CHUNK_SIZE) {
+          upsertMediaFiles(chunk)
+          chunk = []
+        }
       } catch {
         // A file may move between directory enumeration and metadata lookup.
       }
     }
   }
 
-  upsertMediaFiles(discoveredFiles)
-  deleteMissingFiles(rootPath, discoveredFiles.map((file) => file.filePath))
+  if (chunk.length > 0) upsertMediaFiles(chunk)
+  deleteMissingFiles(rootPath, allFilePaths)
   return getFilesInFolder(rootPath).map(toMediaFile)
 }
 

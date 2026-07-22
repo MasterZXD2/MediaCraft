@@ -23,3 +23,8 @@ export interface DirectorySyncData {
   folderPath: string
   files: MediaFile[]
 }
+
+export interface ScanProgressData {
+  current: number
+  total: number
+}

@@ -5,6 +5,9 @@ import { useMediaStore } from '@/store/mediaStore'
 export function TopBar(): JSX.Element {
   const datasetRoot = useMediaStore((state) => state.datasetRoot)
   const isLoading = useMediaStore((state) => state.isLoading)
+  const isProcessing = useMediaStore((state) => state.isProcessing)
+  const progressCurrent = useMediaStore((state) => state.progressCurrent)
+  const progressTotal = useMediaStore((state) => state.progressTotal)
   const setDatasetRoot = useMediaStore((state) => state.setDatasetRoot)
   const loadDirectory = useMediaStore((state) => state.loadDirectory)
 
@@ -45,9 +48,20 @@ export function TopBar(): JSX.Element {
 
       <div className="ml-auto hidden w-44 items-center gap-3 lg:flex">
         <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-secondary">
-          <div className={`h-full rounded-full bg-primary ${isLoading ? 'w-2/3 animate-pulse' : 'w-0'}`} />
+          <div
+            className={`h-full rounded-full bg-primary transition-all duration-200 ${isLoading ? 'animate-pulse' : ''}`}
+            style={{
+              width: isLoading
+                ? '66%'
+                : isProcessing && progressTotal > 0
+                  ? `${(progressCurrent / progressTotal) * 100}%`
+                  : '0%'
+            }}
+          />
         </div>
-        <span className="font-mono text-[10px] text-muted-foreground">{isLoading ? 'Scanning' : 'Ready'}</span>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {isLoading ? 'Scanning' : isProcessing ? `${progressCurrent} / ${progressTotal}` : 'Ready'}
+        </span>
       </div>
 
       <Button variant="outline" size="sm" className="app-no-drag gap-2 bg-background/50 text-muted-foreground">

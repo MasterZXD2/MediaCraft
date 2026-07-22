@@ -12,6 +12,9 @@ interface MediaState {
   datasetRoot: string
   mediaFiles: MediaFile[]
   isLoading: boolean
+  isProcessing: boolean
+  progressCurrent: number
+  progressTotal: number
   error: string | null
   setDatasetRoot: (path: string) => void
   setMediaFiles: (files: MediaFile[]) => void
@@ -22,12 +25,15 @@ export const useMediaStore = create<MediaState>((set) => ({
   datasetRoot: '',
   mediaFiles: [],
   isLoading: false,
+  isProcessing: false,
+  progressCurrent: 0,
+  progressTotal: 0,
   error: null,
   setDatasetRoot: (datasetRoot) => set({ datasetRoot }),
   setMediaFiles: (mediaFiles) => set({ mediaFiles }),
   loadDirectory: async (path) => {
     pendingThumbnailUrls.clear()
-    set({ isLoading: true, error: null, mediaFiles: [] })
+    set({ isLoading: true, error: null, mediaFiles: [], isProcessing: false, progressCurrent: 0, progressTotal: 0 })
     try {
       const scannedFiles = await window.api.scanDirectory(path)
       const mediaFiles = scannedFiles.map((file) => {
@@ -57,6 +63,14 @@ window.api.onThumbnailReady(({ filePath, thumbnailPath }) => {
 
     if (matched) pendingThumbnailUrls.delete(filePath)
     return matched ? { mediaFiles } : state
+  })
+})
+
+window.api.onProgressUpdate(({ current, total }) => {
+  useMediaStore.setState({
+    isProcessing: current < total,
+    progressCurrent: current,
+    progressTotal: total
   })
 })
 
