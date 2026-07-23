@@ -32,7 +32,20 @@ export interface VideoMetadata {
 
 export interface FfmpegOptions {
   signal?: AbortSignal
-  timeoutMs?: number
+  timeoutMs?: number | null
+  onStderr?: (chunk: string) => void
+}
+
+export interface FfmpegProcessResult {
+  stdout: Buffer
+  stderr: string
+}
+
+export function runFfmpeg(
+  args: string[],
+  options: FfmpegOptions = {}
+): Promise<FfmpegProcessResult> {
+  return runProcess(resolveBinary('ffmpeg', 'FFMPEG_PATH'), args, options)
 }
 
 export async function extractVideoFrame(
@@ -147,8 +160,8 @@ function runProcess(
   command: string,
   args: string[],
   options: FfmpegOptions
-): Promise<{ stdout: Buffer; stderr: string }> {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+): Promise<FfmpegProcessResult> {
+  const timeoutMs = options.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : options.timeoutMs
 
   return new Promise((resolveProcess, rejectProcess) => {
     if (options.signal?.aborted) {
@@ -166,6 +179,8 @@ function runProcess(
     let stderr = ''
     let settled = false
     let timer: ReturnType<typeof setTimeout> | undefined
+    let terminationTimer: ReturnType<typeof setTimeout> | undefined
+    let terminationError: FfmpegError | null = null
 
     const appendTextOutput = (current: string, next: Buffer): string => {
       if (current.length >= MAX_CAPTURED_OUTPUT) return current
@@ -182,6 +197,7 @@ function runProcess(
 
     const cleanup = (): void => {
       if (timer) clearTimeout(timer)
+      if (terminationTimer) clearTimeout(terminationTimer)
       options.signal?.removeEventListener('abort', onAbort)
     }
 
@@ -192,18 +208,32 @@ function runProcess(
       rejectProcess(error)
     }
 
-    const onAbort = (): void => {
+    const requestTermination = (error: FfmpegError): void => {
+      if (settled || terminationError) return
+      terminationError = error
       terminateProcess(child)
-      rejectWith(new FfmpegError('FFmpeg operation was aborted.', 'aborted', null, stderr))
+      terminationTimer = setTimeout(() => rejectWith(error), 3_000)
+    }
+
+    const onAbort = (): void => {
+      requestTermination(new FfmpegError('FFmpeg operation was aborted.', 'aborted', null, stderr))
     }
 
     child.stdout?.on('data', (data: Buffer) => { appendBinaryOutput(data) })
-    child.stderr?.on('data', (data: Buffer) => { stderr = appendTextOutput(stderr, data) })
+    child.stderr?.on('data', (data: Buffer) => {
+      const text = data.toString('utf8')
+      try { options.onStderr?.(text) } catch { /* Progress observers must not break FFmpeg. */ }
+      stderr = appendTextOutput(stderr, data)
+    })
     child.once('error', (error) => {
       rejectWith(new FfmpegError(getErrorMessage(error), 'spawn', null, stderr))
     })
     child.once('close', (code, signal) => {
       if (settled) return
+      if (terminationError) {
+        rejectWith(terminationError)
+        return
+      }
       cleanup()
       if (code === 0) {
         settled = true
@@ -220,10 +250,16 @@ function runProcess(
     })
 
     options.signal?.addEventListener('abort', onAbort, { once: true })
-    timer = setTimeout(() => {
-      terminateProcess(child)
-      rejectWith(new FfmpegError(`FFmpeg timed out after ${timeoutMs}ms.`, 'timeout', null, stderr))
-    }, timeoutMs)
+    if (timeoutMs !== null && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        requestTermination(new FfmpegError(
+          `FFmpeg timed out after ${timeoutMs}ms.`,
+          'timeout',
+          null,
+          stderr
+        ))
+      }, timeoutMs)
+    }
   })
 }
 

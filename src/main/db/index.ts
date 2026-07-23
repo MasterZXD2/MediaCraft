@@ -70,6 +70,15 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
 
     CREATE INDEX IF NOT EXISTS idx_media_files_folder_status
       ON media_files (folder_path, status);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_catalog_date
+      ON media_files (folder_path, status, last_modified, file_path);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_catalog_name
+      ON media_files (folder_path, status, filename COLLATE NOCASE, file_path);
+
+    CREATE INDEX IF NOT EXISTS idx_media_files_catalog_size
+      ON media_files (folder_path, status, size_bytes, file_path);
   `)
 
   return database

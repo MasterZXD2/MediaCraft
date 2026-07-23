@@ -17,6 +17,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
+import { TransformModal } from '@/components/transform/TransformModal'
 import {
   bestMediaId,
   compareMediaQuality,
@@ -25,40 +26,73 @@ import {
 } from '@/store/mediaStore'
 
 export function RightSidebar(): JSX.Element {
+  const [transformOpen, setTransformOpen] = useState(false)
   const activeFilter = useMediaStore((state) => state.activeFilter)
-  const selectedId = useMediaStore((state) => state.selectedId)
-  const file = useMediaStore((state) => selectedId ? state.byId[selectedId] : undefined)
+  const selectedIds = useMediaStore((state) => state.selectedIds)
+  const selectedIdList = useMemo(() => Array.from(selectedIds), [selectedIds])
+  const singleId = selectedIdList.length === 1 ? selectedIdList[0] : null
+  const file = useMediaStore((state) => singleId ? state.byId[singleId] : undefined)
+  const selectionSummary = useMemo(() => {
+    const state = useMediaStore.getState()
+    let totalSize = 0
+    let activeCount = 0
+    let trashCount = 0
+    for (const id of selectedIdList) {
+      const selectedFile = state.byId[id]
+      if (!selectedFile) continue
+      totalSize += selectedFile.size
+      if (selectedFile.status === 'active') activeCount++
+      else trashCount++
+    }
+    return { totalSize, activeCount, trashCount }
+  }, [selectedIdList])
 
   return (
-    <aside className="hidden h-full min-h-0 w-80 shrink-0 border-l border-border bg-card/45 lg:block">
-      <ScrollArea className="h-full">
-        <div className="p-4">
-          {activeFilter === 'trash' ? (
-            <TrashManager selectedFile={file?.status === 'trash' ? file : undefined} />
-          ) : (
-            <>
-              <DuplicateScanner />
-              <Separator className="my-5" />
+    <>
+      <aside className="hidden h-full min-h-0 w-80 shrink-0 border-l border-border bg-card/45 lg:block">
+        <ScrollArea className="h-full">
+          <div className="p-4">
+            {activeFilter === 'trash' ? (
+              <TrashManager
+                selectedIds={selectedIdList}
+                selectedFile={file?.status === 'trash' ? file : undefined}
+                selectedSize={selectionSummary.totalSize}
+              />
+            ) : (
+              <>
+                <DuplicateScanner />
+                <Separator className="my-5" />
 
-              {activeFilter === 'duplicates' && file?.duplicateGroupId ? (
-                <DuplicateComparison groupId={file.duplicateGroupId} />
-              ) : (
-                <Inspector file={file?.status === 'active' ? file : undefined} />
-              )}
+                {activeFilter === 'duplicates' && file?.duplicateGroupId ? (
+                  <DuplicateComparison groupId={file.duplicateGroupId} />
+                ) : (
+                  <Inspector
+                    file={file?.status === 'active' ? file : undefined}
+                    selectedCount={selectionSummary.activeCount}
+                    selectedSize={selectionSummary.totalSize}
+                  />
+                )}
 
-              <Separator className="my-5" />
-              <NormalActions file={file?.status === 'active' ? file : undefined} />
-            </>
-          )}
-        </div>
-      </ScrollArea>
-    </aside>
+                <Separator className="my-5" />
+                <NormalActions
+                  selectedIds={selectedIdList}
+                  selectedFile={file?.status === 'active' ? file : undefined}
+                  onOpenTransform={() => setTransformOpen(true)}
+                />
+              </>
+            )}
+          </div>
+        </ScrollArea>
+      </aside>
+      <TransformModal open={transformOpen} onOpenChange={setTransformOpen} />
+    </>
   )
 }
 
 function DuplicateScanner(): JSX.Element {
   const datasetRoot = useMediaStore((state) => state.datasetRoot)
   const isFindingDuplicates = useMediaStore((state) => state.isFindingDuplicates)
+  const isLoading = useMediaStore((state) => state.isLoading)
   const progressCurrent = useMediaStore((state) => state.duplicateProgressCurrent)
   const progressTotal = useMediaStore((state) => state.duplicateProgressTotal)
   const message = useMediaStore((state) => state.duplicateMessage)
@@ -73,7 +107,7 @@ function DuplicateScanner(): JSX.Element {
         variant="outline"
         size="sm"
         className="mt-3 w-full gap-2 bg-background/40"
-        disabled={!datasetRoot || isFindingDuplicates}
+        disabled={!datasetRoot || isFindingDuplicates || isLoading}
         onClick={() => void runDuplicateDetection()}
       >
         {isFindingDuplicates
@@ -102,6 +136,7 @@ function DuplicateScanner(): JSX.Element {
 function DuplicateComparison({ groupId }: { groupId: string }): JSX.Element {
   const duplicateIds = useMediaStore((state) => state.duplicateIds)
   const isResolving = useMediaStore((state) => state.isResolvingDuplicateGroup)
+  const isLoading = useMediaStore((state) => state.isLoading)
   const resolveGroup = useMediaStore((state) => state.resolveDuplicateGroup)
   const groupFiles = useMemo(() => {
     const state = useMediaStore.getState()
@@ -142,7 +177,7 @@ function DuplicateComparison({ groupId }: { groupId: string }): JSX.Element {
       <Button
         size="sm"
         className="mt-3 w-full gap-2"
-        disabled={groupFiles.length < 2 || isResolving}
+        disabled={groupFiles.length < 2 || isResolving || isLoading}
         onClick={() => void resolveGroup(groupId)}
       >
         {isResolving
@@ -159,8 +194,8 @@ function DuplicateComparison({ groupId }: { groupId: string }): JSX.Element {
 
 function ComparisonTile({ id, rank }: { id: string; rank: 'best' | 'middle' | 'lowest' }): JSX.Element | null {
   const file = useMediaStore((state) => state.byId[id])
-  const selected = useMediaStore((state) => state.selectedId === id)
-  const setSelectedId = useMediaStore((state) => state.setSelectedId)
+  const selected = useMediaStore((state) => state.selectedIds.has(id))
+  const selectMedia = useMediaStore((state) => state.selectMedia)
   if (!file) return null
 
   const Icon = file.type === 'video' ? Film : FileImage
@@ -173,7 +208,7 @@ function ComparisonTile({ id, rank }: { id: string; rank: 'best' | 'middle' | 'l
   return (
     <button
       type="button"
-      onClick={() => setSelectedId(id)}
+      onClick={() => selectMedia(id)}
       className={`min-w-0 overflow-hidden rounded-md border text-left transition-shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${rankStyles} ${
         selected ? 'ring-2 ring-primary/50' : ''
       }`}
@@ -201,12 +236,21 @@ function ComparisonTile({ id, rank }: { id: string; rank: 'best' | 'middle' | 'l
   )
 }
 
-function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.Element {
+function TrashManager({
+  selectedIds,
+  selectedFile,
+  selectedSize
+}: {
+  selectedIds: string[]
+  selectedFile?: MediaFileData
+  selectedSize: number
+}): JSX.Element {
   const [confirmEmpty, setConfirmEmpty] = useState(false)
   const totalTrash = useMediaStore((state) => state.totalTrash)
   const totalTrashSize = useMediaStore((state) => state.totalTrashSize)
   const isRestoring = useMediaStore((state) => state.isRestoring)
   const isEmptying = useMediaStore((state) => state.isEmptyingTrash)
+  const isLoading = useMediaStore((state) => state.isLoading)
   const error = useMediaStore((state) => state.cleanupError)
   const restore = useMediaStore((state) => state.restoreFromTrash)
   const emptyTrash = useMediaStore((state) => state.emptyTrash)
@@ -214,6 +258,10 @@ function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.E
   const confirmAndEmpty = async (): Promise<void> => {
     await emptyTrash()
     setConfirmEmpty(false)
+  }
+
+  const restoreSelected = async (): Promise<void> => {
+    for (const id of selectedIds) await restore(id)
   }
 
   return (
@@ -229,7 +277,9 @@ function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.E
       </div>
 
       <div className="mt-4">
-        {selectedFile ? (
+        {selectedIds.length > 1 ? (
+          <AggregateSelection count={selectedIds.length} totalSize={selectedSize} />
+        ) : selectedFile ? (
           <SelectedMediaInspector file={selectedFile} />
         ) : (
           <EmptySelection
@@ -244,13 +294,13 @@ function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.E
         variant="outline"
         size="sm"
         className="mt-4 w-full gap-2"
-        disabled={!selectedFile || isRestoring || isEmptying}
-        onClick={() => selectedFile && void restore(selectedFile.id)}
+        disabled={selectedIds.length === 0 || isRestoring || isEmptying}
+        onClick={() => void restoreSelected()}
       >
         {isRestoring
           ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
           : <RotateCcw className="h-3.5 w-3.5" />}
-        Restore Selected
+        Restore {selectedIds.length > 1 ? `${selectedIds.length} Items` : 'Selected'}
       </Button>
 
       <Separator className="my-5" />
@@ -260,7 +310,7 @@ function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.E
           variant="destructive"
           size="sm"
           className="w-full gap-2 bg-destructive"
-          disabled={totalTrash === 0 || isEmptying}
+          disabled={totalTrash === 0 || isEmptying || isLoading}
           onClick={() => setConfirmEmpty(true)}
           title="Moves catalog trash files to the operating system Recycle Bin"
         >
@@ -296,7 +346,15 @@ function TrashManager({ selectedFile }: { selectedFile?: MediaFileData }): JSX.E
   )
 }
 
-function Inspector({ file }: { file?: MediaFileData }): JSX.Element {
+function Inspector({
+  file,
+  selectedCount,
+  selectedSize
+}: {
+  file?: MediaFileData
+  selectedCount: number
+  selectedSize: number
+}): JSX.Element {
   return (
     <section>
       <div className="flex items-center justify-between">
@@ -305,7 +363,9 @@ function Inspector({ file }: { file?: MediaFileData }): JSX.Element {
           <span className="rounded-full bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">Selected</span>
         )}
       </div>
-      {file ? (
+      {selectedCount > 1 ? (
+        <AggregateSelection count={selectedCount} totalSize={selectedSize} />
+      ) : file ? (
         <SelectedMediaInspector file={file} />
       ) : (
         <EmptySelection
@@ -315,6 +375,25 @@ function Inspector({ file }: { file?: MediaFileData }): JSX.Element {
         />
       )}
     </section>
+  )
+}
+
+function AggregateSelection({ count, totalSize }: { count: number; totalSize: number }): JSX.Element {
+  return (
+    <div className="mt-4 border-l-2 border-primary bg-primary/5 px-4 py-5">
+      <div className="flex items-center gap-3">
+        <div className="grid h-9 w-9 place-items-center rounded-md bg-primary/10 text-primary">
+          <Check className="h-4 w-4" />
+        </div>
+        <div>
+          <p className="text-sm font-semibold">{count.toLocaleString()} items selected</p>
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground">{formatBytes(totalSize)} combined</p>
+        </div>
+      </div>
+      <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
+        Batch actions apply to every selected item.
+      </p>
+    </div>
   )
 }
 
@@ -354,16 +433,46 @@ function SelectedMediaInspector({ file }: { file: MediaFileData }): JSX.Element 
   )
 }
 
-function NormalActions({ file }: { file?: MediaFileData }): JSX.Element {
+function NormalActions({
+  selectedIds,
+  selectedFile,
+  onOpenTransform
+}: {
+  selectedIds: string[]
+  selectedFile?: MediaFileData
+  onOpenTransform: () => void
+}): JSX.Element {
   const isTrashing = useMediaStore((state) => state.isTrashing)
+  const isTransformStarting = useMediaStore((state) => state.isTransformStarting)
+  const isTransforming = useMediaStore((state) => state.isTransforming)
   const error = useMediaStore((state) => state.cleanupError)
+  const transformError = useMediaStore((state) => state.transformError)
   const moveToTrash = useMediaStore((state) => state.moveToTrash)
+  const activeSelectionCount = useMemo(() => {
+    const state = useMediaStore.getState()
+    return selectedIds.reduce(
+      (count, id) => count + (state.byId[id]?.status === 'active' ? 1 : 0),
+      0
+    )
+  }, [selectedIds])
 
   return (
     <section>
       <p className="mb-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Actions</p>
       <div className="grid grid-cols-2 gap-2">
-        <PlaceholderAction icon={WandSparkles} label="Convert" phase="Transform" />
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-16 flex-col gap-1.5 bg-background/40"
+          disabled={activeSelectionCount === 0 || isTransformStarting || isTransforming}
+          onClick={onOpenTransform}
+          title={activeSelectionCount > 0 ? `Convert ${activeSelectionCount} selected item${activeSelectionCount === 1 ? '' : 's'}` : 'Select media to convert'}
+        >
+          {isTransformStarting || isTransforming
+            ? <LoaderCircle className="h-4 w-4 animate-spin text-primary" />
+            : <WandSparkles className="h-4 w-4 text-primary" />}
+          {isTransforming ? 'Converting' : 'Convert'}
+        </Button>
         <PlaceholderAction icon={RotateCw} label="Rotate" phase="Transform" />
         <PlaceholderAction icon={Archive} label="Export" phase="Organize" />
         <PlaceholderAction icon={Sparkles} label="Enhance" phase="Transform" />
@@ -372,9 +481,11 @@ function NormalActions({ file }: { file?: MediaFileData }): JSX.Element {
         variant="destructive"
         size="sm"
         className="mt-2 w-full gap-2 bg-destructive/85"
-        disabled={!file || isTrashing}
-        onClick={() => file && void moveToTrash(file.id)}
-        title="Move this item to MediaCraft soft trash"
+        disabled={!selectedFile || selectedIds.length !== 1 || isTrashing}
+        onClick={() => selectedFile && void moveToTrash(selectedFile.id)}
+        title={selectedIds.length > 1
+          ? 'Select one item to move it to trash'
+          : 'Move this item to MediaCraft soft trash'}
       >
         {isTrashing
           ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
@@ -382,6 +493,7 @@ function NormalActions({ file }: { file?: MediaFileData }): JSX.Element {
         Move to trash
       </Button>
       {error && <p className="mt-2 text-[10px] text-destructive">{error}</p>}
+      {transformError && <p className="mt-2 text-[10px] text-destructive">{transformError}</p>}
     </section>
   )
 }

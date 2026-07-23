@@ -4,9 +4,10 @@ import { pathToFileURL } from 'node:url'
 import { CatalogWorkerCoordinator } from './ipc/scanner'
 import { DuplicateIpcController } from './ipc/duplicates'
 import { CleanupIpcController } from './ipc/cleanup'
+import { TransformIpcController } from './ipc/transform'
 import { PriorityMediaScheduler } from './lib/scheduler'
 import { initializeThumbnailCache } from './lib/thumbnail'
-import type { CatalogStreamEvent } from '../shared/catalog'
+import type { CatalogQueryInput, CatalogSortBy, CatalogStreamEvent } from '../shared/catalog'
 import type { MediaFile } from '../shared/media'
 
 const MEDIA_PROTOCOL = 'mediacraft-media'
@@ -14,10 +15,13 @@ const selectedDirectories = new Set<string>()
 const allowedSourceFiles = new Set<string>()
 const allowedThumbnailFiles = new Set<string>()
 const thumbnailTargets = new Map<number, WebContents>()
+const queuedThumbnailIds = new Set<string>()
+const CATALOG_SORTS = new Set<CatalogSortBy>(['date_desc', 'date_asc', 'name_asc', 'size_desc'])
 let thumbnailRunId = 0
 let catalogWorker: CatalogWorkerCoordinator | null = null
 let duplicateIpc: DuplicateIpcController | null = null
 let cleanupIpc: CleanupIpcController | null = null
+let transformIpc: TransformIpcController | null = null
 let shutdownStarted = false
 let shutdownFinished = false
 
@@ -79,9 +83,25 @@ function registerIpcHandlers(coordinator: CatalogWorkerCoordinator): void {
     thumbnailTargets.set(runId, event.sender)
     allowedSourceFiles.clear()
     allowedThumbnailFiles.clear()
-    const queuedThumbnailIds = new Set<string>()
+    queuedThumbnailIds.clear()
 
     return coordinator.startScan(folderPath, (catalogEvent) => {
+      if (runId !== thumbnailRunId || event.sender.isDestroyed()) return
+      handleCatalogEvent(catalogEvent, event.sender, runId, queuedThumbnailIds)
+    })
+  })
+
+  ipcMain.handle('query-catalog', (event, input: unknown) => {
+    const query = parseCatalogQuery(input)
+    const folderPath = resolve(query.folderPath)
+    if (!selectedDirectories.has(normalizeForComparison(folderPath))) {
+      throw new Error('The catalog folder is not authorized.')
+    }
+    if (thumbnailRunId === 0) throw new Error('Scan a media folder before querying its catalog.')
+
+    const runId = thumbnailRunId
+    thumbnailTargets.set(runId, event.sender)
+    return coordinator.startQuery({ ...query, folderPath }, (catalogEvent) => {
       if (runId !== thumbnailRunId || event.sender.isDestroyed()) return
       handleCatalogEvent(catalogEvent, event.sender, runId, queuedThumbnailIds)
     })
@@ -104,8 +124,10 @@ function handleCatalogEvent(
 ): void {
   if (event.type === 'reset') {
     allowedSourceFiles.clear()
-    allowedThumbnailFiles.clear()
-    queuedThumbnailIds.clear()
+    if (event.operation === 'scan') {
+      allowedThumbnailFiles.clear()
+      queuedThumbnailIds.clear()
+    }
     webContents.send('catalog-event', event)
     return
   }
@@ -139,6 +161,31 @@ function handleCatalogEvent(
   }
 
   webContents.send('catalog-event', event)
+}
+
+function parseCatalogQuery(input: unknown): CatalogQueryInput {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new Error('Invalid catalog query.')
+  }
+  const value = input as Record<string, unknown>
+  if (typeof value.requestId !== 'string' || value.requestId.length < 8 || value.requestId.length > 128) {
+    throw new Error('Invalid catalog request ID.')
+  }
+  if (typeof value.folderPath !== 'string' || value.folderPath.length === 0) {
+    throw new Error('A catalog folder is required.')
+  }
+  if (typeof value.searchQuery !== 'string' || value.searchQuery.length > 256) {
+    throw new Error('The search query is invalid or too long.')
+  }
+  if (typeof value.sortBy !== 'string' || !CATALOG_SORTS.has(value.sortBy as CatalogSortBy)) {
+    throw new Error('Invalid catalog sort order.')
+  }
+  return {
+    requestId: value.requestId,
+    folderPath: value.folderPath,
+    searchQuery: value.searchQuery.trim(),
+    sortBy: value.sortBy as CatalogSortBy
+  }
 }
 
 function registerMediaProtocol(): void {
@@ -221,6 +268,8 @@ app.whenReady().then(async () => {
     (filePath) => allowedSourceFiles.delete(normalizeForComparison(filePath))
   )
   cleanupIpc.register()
+  transformIpc = new TransformIpcController(catalogWorker, thumbnailScheduler)
+  transformIpc.register()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -239,8 +288,10 @@ app.on('before-quit', (event) => {
   shutdownStarted = true
   ipcMain.removeHandler('select-folder')
   ipcMain.removeHandler('scan-directory')
+  ipcMain.removeHandler('query-catalog')
   ipcMain.removeAllListeners('visible-media-ids')
   cleanupIpc?.shutdown()
+  transformIpc?.shutdown()
   void Promise.all([
     catalogWorker.shutdown(),
     thumbnailScheduler.shutdown(),

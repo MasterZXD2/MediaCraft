@@ -6,6 +6,8 @@ import type {
 } from '../../shared/duplicates'
 import { getDatabase } from './index'
 import type { MoveToTrashResult } from '../../shared/cleanup'
+import type { CatalogMediaReference } from '../../shared/transform'
+import type { CatalogSortBy } from '../../shared/catalog'
 
 export interface MediaFileData {
   id?: number
@@ -35,6 +37,36 @@ interface MediaFileRow {
   fps: number | null
   last_modified: number
   duplicate_group_id: string | null
+}
+
+type CatalogStatus = 'active' | 'trash'
+
+const CATALOG_ORDER_BY: Record<CatalogSortBy, string> = {
+  date_desc: 'last_modified DESC, file_path COLLATE NOCASE ASC',
+  date_asc: 'last_modified ASC, file_path COLLATE NOCASE ASC',
+  name_asc: 'filename COLLATE NOCASE ASC, file_path COLLATE NOCASE ASC',
+  size_desc: 'size_bytes DESC, file_path COLLATE NOCASE ASC'
+}
+
+function prepareCatalogPages(
+  db: ReturnType<typeof getDatabase>,
+  status: CatalogStatus
+) {
+  return Object.fromEntries(
+    (Object.entries(CATALOG_ORDER_BY) as Array<[CatalogSortBy, string]>).map(([sortBy, orderBy]) => [
+      sortBy,
+      db.prepare(`
+        SELECT id, folder_path, file_path, filename, type, size_bytes,
+               width, height, duration, fps, last_modified, duplicate_group_id
+        FROM media_files
+        WHERE folder_path = @folder_path
+          AND status = '${status}'
+          AND filename LIKE @search_pattern ESCAPE '!'
+        ORDER BY ${orderBy}
+        LIMIT @limit OFFSET @offset
+      `)
+    ])
+  ) as Record<CatalogSortBy, ReturnType<typeof db.prepare>>
 }
 
 function prepareStatements() {
@@ -106,27 +138,27 @@ function prepareStatements() {
     FROM media_files
     WHERE folder_path = ? AND status = 'active'
   `)
-  const getByFolderPage = db.prepare(`
-    SELECT id, folder_path, file_path, filename, type, size_bytes,
-           width, height, duration, fps, last_modified, duplicate_group_id
+  const countCatalogPage = db.prepare(`
+    SELECT COUNT(*) AS count
     FROM media_files
-    WHERE folder_path = ? AND status = 'active'
-    ORDER BY file_path COLLATE NOCASE
-    LIMIT ? OFFSET ?
+    WHERE folder_path = @folder_path
+      AND status = @status
+      AND filename LIKE @search_pattern ESCAPE '!'
   `)
+  const catalogPages = {
+    active: prepareCatalogPages(db, 'active'),
+    trash: prepareCatalogPages(db, 'trash')
+  }
   const getActiveByPath = db.prepare(`
     SELECT id, folder_path, file_path, filename, type, size_bytes,
            width, height, duration, fps, last_modified, duplicate_group_id
     FROM media_files
     WHERE file_path = ? AND status = 'active'
   `)
-  const getTrashByFolderPage = db.prepare(`
-    SELECT id, folder_path, file_path, filename, type, size_bytes,
-           width, height, duration, fps, last_modified, duplicate_group_id
+  const getActiveReference = db.prepare(`
+    SELECT file_path, folder_path, filename, type
     FROM media_files
-    WHERE folder_path = ? AND status = 'trash'
-    ORDER BY file_path COLLATE NOCASE
-    LIMIT ? OFFSET ?
+    WHERE file_path = ? AND status = 'active'
   `)
   const countTrashByFolder = db.prepare(`
     SELECT COUNT(*) AS count
@@ -253,6 +285,7 @@ function prepareStatements() {
   const commitGeneration = db.transaction((folderPath: string, activeGeneration: number) => {
     const removed = selectOlderGeneration.all(folderPath, activeGeneration) as Array<{
       file_path: string
+      folder_path: string
     }>
     deleteOlderGeneration.run(folderPath, activeGeneration)
     return removed.map((row) => row.file_path)
@@ -297,7 +330,8 @@ function prepareStatements() {
     upsert,
     getByFolder,
     countByFolder,
-    getByFolderPage,
+    countCatalogPage,
+    catalogPages,
     getLatestGeneration,
     getDuplicateCandidatesPage,
     upsertMany,
@@ -305,11 +339,11 @@ function prepareStatements() {
     saveHashes,
     saveGroups,
     trashFile,
-    getTrashByFolderPage,
     countTrashByFolder,
     getTrashPathsPage,
     restoreTrash,
-    deleteTrashRecords
+    deleteTrashRecords,
+    getActiveReference
   }
 }
 
@@ -341,13 +375,28 @@ export function getFilesInFolder(folderPath: string): MediaFileData[] {
   return rows.map(fromRow)
 }
 
-export function countFilesInFolder(folderPath: string): number {
-  const row = getStatements().countByFolder.get(folderPath) as { count: number }
+export function countFilesInFolder(folderPath: string, searchQuery = ''): number {
+  const row = getStatements().countCatalogPage.get({
+    folder_path: folderPath,
+    status: 'active',
+    search_pattern: toLikePattern(searchQuery)
+  }) as { count: number }
   return row.count
 }
 
-export function getFilesInFolderPage(folderPath: string, limit: number, offset: number): MediaFileData[] {
-  const rows = getStatements().getByFolderPage.all(folderPath, limit, offset) as MediaFileRow[]
+export function getFilesInFolderPage(
+  folderPath: string,
+  searchQuery: string,
+  sortBy: CatalogSortBy,
+  limit: number,
+  offset: number
+): MediaFileData[] {
+  const rows = getStatements().catalogPages.active[sortBy].all({
+    folder_path: folderPath,
+    search_pattern: toLikePattern(searchQuery),
+    limit,
+    offset
+  }) as MediaFileRow[]
   return rows.map(fromRow)
 }
 
@@ -406,17 +455,28 @@ export function restoreFromTrash(fileId: string): boolean {
   return getStatements().restoreTrash.run(fileId).changes > 0
 }
 
-export function countTrashInFolder(folderPath: string): number {
-  const row = getStatements().countTrashByFolder.get(folderPath) as { count: number }
+export function countTrashInFolder(folderPath: string, searchQuery = ''): number {
+  const row = getStatements().countCatalogPage.get({
+    folder_path: folderPath,
+    status: 'trash',
+    search_pattern: toLikePattern(searchQuery)
+  }) as { count: number }
   return row.count
 }
 
 export function getTrashInFolderPage(
   folderPath: string,
+  searchQuery: string,
+  sortBy: CatalogSortBy,
   limit: number,
   offset: number
 ): MediaFileData[] {
-  const rows = getStatements().getTrashByFolderPage.all(folderPath, limit, offset) as MediaFileRow[]
+  const rows = getStatements().catalogPages.trash[sortBy].all({
+    folder_path: folderPath,
+    search_pattern: toLikePattern(searchQuery),
+    limit,
+    offset
+  }) as MediaFileRow[]
   return rows.map(fromRow)
 }
 
@@ -435,6 +495,34 @@ export function getTrashPathsPage(
 
 export function deleteTrashRecords(fileIds: string[]): number {
   return fileIds.length > 0 ? getStatements().deleteTrashRecords(fileIds) : 0
+}
+
+export function getMediaReferences(fileIds: string[]): CatalogMediaReference[] {
+  const statement = getStatements().getActiveReference
+  const files: CatalogMediaReference[] = []
+  for (const fileId of fileIds) {
+    const row = statement.get(fileId) as {
+      folder_path: string
+      file_path: string
+      filename: string
+      type: MediaType
+    } | undefined
+    if (row) {
+      files.push({
+        fileId,
+        filePath: row.file_path,
+        folderPath: row.folder_path,
+        filename: row.filename,
+        type: row.type
+      })
+    }
+  }
+  return files
+}
+
+function toLikePattern(searchQuery: string): string {
+  const escapedQuery = searchQuery.replace(/[!%_]/g, '!$&')
+  return `%${escapedQuery}%`
 }
 
 function toBindings(

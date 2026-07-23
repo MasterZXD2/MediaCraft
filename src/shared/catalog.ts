@@ -5,13 +5,27 @@ import type {
   PerceptualHashUpdate
 } from './duplicates'
 import type { MoveToTrashResult } from './cleanup'
+import type { CatalogMediaReference } from './transform'
 
 export interface CatalogScanRequest {
   requestId: string
   folderPath: string
 }
 
-interface CatalogEventBase extends CatalogScanRequest {}
+export type CatalogSortBy = 'date_desc' | 'date_asc' | 'name_asc' | 'size_desc'
+
+export interface CatalogQueryOptions {
+  searchQuery: string
+  sortBy: CatalogSortBy
+}
+
+export interface CatalogQueryInput extends CatalogScanRequest, CatalogQueryOptions {}
+
+export type CatalogOperation = 'scan' | 'query'
+
+interface CatalogEventBase extends CatalogScanRequest {
+  operation: CatalogOperation
+}
 
 export interface CatalogResetEvent extends CatalogEventBase {
   type: 'reset'
@@ -54,6 +68,8 @@ export type CatalogStreamEvent =
 export type CatalogWorkerCommand =
   | { type: 'scan'; requestId: string; folderPath: string }
   | { type: 'cancel'; requestId: string }
+  | ({ type: 'query-catalog' } & CatalogQueryInput)
+  | { type: 'cancel-query'; requestId: string }
   | { type: 'get-duplicate-candidates'; requestId: string; folderPath: string }
   | { type: 'save-perceptual-hashes'; requestId: string; updates: PerceptualHashUpdate[] }
   | {
@@ -66,6 +82,7 @@ export type CatalogWorkerCommand =
   | { type: 'restore-from-trash'; requestId: string; filePath: string }
   | { type: 'get-trash-paths'; requestId: string; folderPath: string }
   | { type: 'delete-trash-records'; requestId: string; filePaths: string[] }
+  | { type: 'get-media-references'; requestId: string; fileIds: string[] }
   | { type: 'shutdown' }
 
 export type CatalogWorkerMessage =
@@ -79,5 +96,6 @@ export type CatalogWorkerMessage =
   | { type: 'trash-paths-chunk'; requestId: string; filePaths: string[] }
   | { type: 'trash-paths-complete'; requestId: string; total: number }
   | { type: 'trash-delete-complete'; requestId: string; deletedCount: number }
+  | { type: 'media-references-complete'; requestId: string; files: CatalogMediaReference[] }
   | { type: 'duplicate-request-error'; requestId: string; message: string }
   | CatalogStreamEvent

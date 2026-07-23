@@ -3,6 +3,8 @@ import type { Worker } from 'node:worker_threads'
 import createCatalogWorker from '../workers/catalogWorker?nodeWorker'
 import type {
   CatalogErrorEvent,
+  CatalogQueryInput,
+  CatalogQueryOptions,
   CatalogScanRequest,
   CatalogStreamEvent,
   CatalogWorkerCommand,
@@ -14,11 +16,13 @@ import type {
   PerceptualHashUpdate
 } from '../../shared/duplicates'
 import type { MoveToTrashResult } from '../../shared/cleanup'
+import type { CatalogMediaReference } from '../../shared/transform'
 
 type CatalogEventListener = (event: CatalogStreamEvent) => void
 
 interface ActiveRequest {
   folderPath: string
+  operation: 'scan' | 'query'
   listener: CatalogEventListener
 }
 
@@ -54,6 +58,11 @@ interface TrashDeleteRequest {
   reject: (error: Error) => void
 }
 
+interface MediaReferenceRequest {
+  resolve: (files: CatalogMediaReference[]) => void
+  reject: (error: Error) => void
+}
+
 export class CatalogWorkerCoordinator {
   private readonly worker: Worker
   private readonly requests = new Map<string, ActiveRequest>()
@@ -63,11 +72,13 @@ export class CatalogWorkerCoordinator {
   private readonly restoreWriteRequests = new Map<string, RestoreWriteRequest>()
   private readonly trashPathRequests = new Map<string, TrashPathRequest>()
   private readonly trashDeleteRequests = new Map<string, TrashDeleteRequest>()
+  private readonly mediaReferenceRequests = new Map<string, MediaReferenceRequest>()
   private readonly readyPromise: Promise<void>
   private resolveReady!: () => void
   private rejectReady!: (error: Error) => void
   private resolveShutdown: (() => void) | null = null
   private activeRequestId: string | null = null
+  private activeQueryRequestId: string | null = null
   private shutdownPromise: Promise<void> | null = null
   private readySettled = false
   private shuttingDown = false
@@ -98,12 +109,40 @@ export class CatalogWorkerCoordinator {
       this.postMessage({ type: 'cancel', requestId: this.activeRequestId })
       this.requests.delete(this.activeRequestId)
     }
+    if (this.activeQueryRequestId) {
+      this.postMessage({ type: 'cancel-query', requestId: this.activeQueryRequestId })
+      this.requests.delete(this.activeQueryRequestId)
+      this.activeQueryRequestId = null
+    }
 
     const requestId = randomUUID()
     const request = { requestId, folderPath }
     this.activeRequestId = requestId
-    this.requests.set(requestId, { folderPath, listener })
+    this.requests.set(requestId, { folderPath, operation: 'scan', listener })
     this.postMessage({ type: 'scan', ...request })
+    return request
+  }
+
+  startQuery(input: CatalogQueryInput, listener: CatalogEventListener): CatalogScanRequest {
+    if (this.shuttingDown) throw new Error('Catalog worker is shutting down.')
+
+    if (this.activeQueryRequestId) {
+      this.postMessage({ type: 'cancel-query', requestId: this.activeQueryRequestId })
+      this.requests.delete(this.activeQueryRequestId)
+    }
+
+    const request = { requestId: input.requestId, folderPath: input.folderPath }
+    this.activeQueryRequestId = input.requestId
+    this.requests.set(input.requestId, {
+      folderPath: input.folderPath,
+      operation: 'query',
+      listener
+    })
+    const query: CatalogQueryOptions = {
+      searchQuery: input.searchQuery,
+      sortBy: input.sortBy
+    }
+    this.postMessage({ type: 'query-catalog', ...request, ...query })
     return request
   }
 
@@ -194,6 +233,21 @@ export class CatalogWorkerCoordinator {
     return result
   }
 
+  getMediaReferences(fileIds: string[]): Promise<CatalogMediaReference[]> {
+    if (this.shuttingDown) return Promise.reject(new Error('Catalog worker is shutting down.'))
+    if (fileIds.length === 0) return Promise.resolve([])
+
+    const requestId = randomUUID()
+    const result = new Promise<CatalogMediaReference[]>((resolveRequest, rejectRequest) => {
+      this.mediaReferenceRequests.set(requestId, {
+        resolve: resolveRequest,
+        reject: rejectRequest
+      })
+    })
+    this.postMessage({ type: 'get-media-references', requestId, fileIds })
+    return result
+  }
+
   shutdown(): Promise<void> {
     this.shutdownPromise ??= this.performShutdown()
     return this.shutdownPromise
@@ -269,6 +323,14 @@ export class CatalogWorkerCoordinator {
       return
     }
 
+    if (message.type === 'media-references-complete') {
+      const request = this.mediaReferenceRequests.get(message.requestId)
+      if (!request) return
+      this.mediaReferenceRequests.delete(message.requestId)
+      request.resolve(message.files)
+      return
+    }
+
     if (message.type === 'duplicate-request-error') {
       const error = new Error(message.message)
       const candidateRequest = this.duplicateCandidateRequests.get(message.requestId)
@@ -301,6 +363,11 @@ export class CatalogWorkerCoordinator {
         this.trashDeleteRequests.delete(message.requestId)
         deleteRequest.reject(error)
       }
+      const mediaRequest = this.mediaReferenceRequests.get(message.requestId)
+      if (mediaRequest) {
+        this.mediaReferenceRequests.delete(message.requestId)
+        mediaRequest.reject(error)
+      }
       return
     }
 
@@ -311,6 +378,7 @@ export class CatalogWorkerCoordinator {
     if (message.type === 'complete' || message.type === 'error') {
       this.requests.delete(message.requestId)
       if (this.activeRequestId === message.requestId) this.activeRequestId = null
+      if (this.activeQueryRequestId === message.requestId) this.activeQueryRequestId = null
     }
   }
 
@@ -325,30 +393,35 @@ export class CatalogWorkerCoordinator {
         type: 'error',
         requestId,
         folderPath: request.folderPath,
+        operation: request.operation,
         message: error.message
       }
       request.listener(event)
     }
     this.requests.clear()
     this.activeRequestId = null
+    this.activeQueryRequestId = null
     for (const request of this.duplicateCandidateRequests.values()) request.reject(error)
     for (const request of this.duplicateWriteRequests.values()) request.reject(error)
     for (const request of this.trashWriteRequests.values()) request.reject(error)
     for (const request of this.restoreWriteRequests.values()) request.reject(error)
     for (const request of this.trashPathRequests.values()) request.reject(error)
     for (const request of this.trashDeleteRequests.values()) request.reject(error)
+    for (const request of this.mediaReferenceRequests.values()) request.reject(error)
     this.duplicateCandidateRequests.clear()
     this.duplicateWriteRequests.clear()
     this.trashWriteRequests.clear()
     this.restoreWriteRequests.clear()
     this.trashPathRequests.clear()
     this.trashDeleteRequests.clear()
+    this.mediaReferenceRequests.clear()
   }
 
   private async performShutdown(): Promise<void> {
     this.shuttingDown = true
     this.requests.clear()
     this.activeRequestId = null
+    this.activeQueryRequestId = null
     const shutdownError = new Error('Catalog worker is shutting down.')
     for (const request of this.duplicateCandidateRequests.values()) request.reject(shutdownError)
     for (const request of this.duplicateWriteRequests.values()) request.reject(shutdownError)
@@ -356,12 +429,14 @@ export class CatalogWorkerCoordinator {
     for (const request of this.restoreWriteRequests.values()) request.reject(shutdownError)
     for (const request of this.trashPathRequests.values()) request.reject(shutdownError)
     for (const request of this.trashDeleteRequests.values()) request.reject(shutdownError)
+    for (const request of this.mediaReferenceRequests.values()) request.reject(shutdownError)
     this.duplicateCandidateRequests.clear()
     this.duplicateWriteRequests.clear()
     this.trashWriteRequests.clear()
     this.restoreWriteRequests.clear()
     this.trashPathRequests.clear()
     this.trashDeleteRequests.clear()
+    this.mediaReferenceRequests.clear()
 
     const acknowledgement = new Promise<void>((resolveAcknowledgement) => {
       this.resolveShutdown = resolveAcknowledgement

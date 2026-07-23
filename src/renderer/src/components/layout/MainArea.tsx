@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { FolderOpen, Grid2X2, List, LoaderCircle, Search, SlidersHorizontal } from 'lucide-react'
+import { FolderOpen, LoaderCircle } from 'lucide-react'
 import { MediaCard } from '@/components/curate/MediaCard'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { selectActiveMediaCount, selectActiveMediaIds, useMediaStore } from '@/store/mediaStore'
 
 const GRID_PADDING = 16
@@ -11,11 +9,14 @@ const GRID_GAP = 12
 const MIN_CARD_WIDTH = 180
 const MAX_COLUMNS = 5
 const CARD_DETAILS_HEIGHT = 56
+const LIST_ITEM_HEIGHT = 88
 
 export function MainArea(): JSX.Element {
   const allIds = useMediaStore(selectActiveMediaIds)
   const itemCount = useMediaStore(selectActiveMediaCount)
   const activeFilter = useMediaStore((state) => state.activeFilter)
+  const viewMode = useMediaStore((state) => state.viewMode)
+  const isCatalogQuerying = useMediaStore((state) => state.isCatalogQuerying)
   const totalSize = useMediaStore((state) => state.totalSize)
   const totalTrashSize = useMediaStore((state) => state.totalTrashSize)
   const datasetRoot = useMediaStore((state) => state.datasetRoot)
@@ -24,13 +25,16 @@ export function MainArea(): JSX.Element {
   const scrollParentRef = useRef<HTMLDivElement>(null)
   const containerWidth = useElementWidth(scrollParentRef)
   const contentWidth = Math.max(0, containerWidth - GRID_PADDING * 2)
-  const columnCount = useMemo(() => {
+  const gridColumnCount = useMemo(() => {
     if (contentWidth === 0) return 1
     const fittingColumns = Math.floor((contentWidth + GRID_GAP) / (MIN_CARD_WIDTH + GRID_GAP))
     return Math.max(1, Math.min(MAX_COLUMNS, fittingColumns))
   }, [contentWidth])
+  const columnCount = viewMode === 'grid' ? gridColumnCount : 1
   const cardWidth = Math.max(0, (contentWidth - GRID_GAP * (columnCount - 1)) / columnCount)
-  const cardHeight = cardWidth * 0.75 + CARD_DETAILS_HEIGHT
+  const cardHeight = viewMode === 'grid'
+    ? cardWidth * 0.75 + CARD_DETAILS_HEIGHT
+    : LIST_ITEM_HEIGHT
   const rowStride = cardHeight + GRID_GAP
   const getItemKey = useCallback((index: number) => allIds[index] ?? index, [allIds])
 
@@ -40,7 +44,7 @@ export function MainArea(): JSX.Element {
     estimateSize: () => rowStride,
     getItemKey,
     lanes: columnCount,
-    overscan: 4
+    overscan: viewMode === 'grid' ? 4 : 8
   })
   const virtualItems = virtualizer.getVirtualItems()
   const visibleIds = useMemo(
@@ -54,7 +58,7 @@ export function MainArea(): JSX.Element {
 
   useLayoutEffect(() => {
     virtualizer.measure()
-  }, [cardWidth, columnCount, virtualizer])
+  }, [cardWidth, columnCount, viewMode, virtualizer])
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-background">
@@ -67,26 +71,16 @@ export function MainArea(): JSX.Element {
             {activeFilter === 'trash' ? ` - ${formatBytes(totalTrashSize)}` : ''}
           </p>
         </div>
-        <div className="relative ml-auto hidden w-48 sm:block xl:w-64">
-          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input placeholder="Search library..." className="h-8 bg-card/60 pl-8 text-xs" />
-        </div>
-        <Button variant="outline" size="icon" className="h-8 w-8 bg-card/60">
-          <SlidersHorizontal className="h-3.5 w-3.5" />
-        </Button>
-        <div className="flex rounded-md border border-border bg-card/60 p-0.5">
-          <Button variant="secondary" size="icon" className="h-7 w-7">
-            <Grid2X2 className="h-3.5 w-3.5" />
-          </Button>
-          <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground">
-            <List className="h-3.5 w-3.5" />
-          </Button>
-        </div>
       </div>
 
       <div ref={scrollParentRef} className="min-h-0 flex-1 overflow-auto">
         {isLoading && itemCount === 0 ? (
-          <StatusPanel icon={LoaderCircle} title="Scanning folder" message="Finding images and videos..." spinning />
+          <StatusPanel
+            icon={LoaderCircle}
+            title={isCatalogQuerying ? 'Updating catalog view' : 'Scanning folder'}
+            message={isCatalogQuerying ? 'Applying search and sort options...' : 'Finding images and videos...'}
+            spinning
+          />
         ) : error ? (
           <StatusPanel icon={FolderOpen} title="Scan failed" message={error} tone="error" />
         ) : itemCount === 0 ? (
@@ -126,7 +120,7 @@ export function MainArea(): JSX.Element {
                     transform: `translate3d(${virtualItem.lane * (cardWidth + GRID_GAP)}px, ${virtualItem.start}px, 0)`
                   }}
                 >
-                  <MediaCard id={id} />
+                  <MediaCard id={id} viewMode={viewMode} />
                 </div>
               )
             })}

@@ -26,8 +26,27 @@ export interface ThumbnailSchedulerProgress {
   total: number
 }
 
+export interface BackgroundMediaJob {
+  jobId: string
+  groupId: string
+  id: string
+  type: MediaType
+  execute: (signal: AbortSignal) => Promise<void>
+  onSettled: (error: unknown | null) => void
+}
+
+export class MediaJobCancelledError extends Error {
+  constructor(message = 'Media job was cancelled.') {
+    super(message)
+    this.name = 'MediaJobCancelledError'
+  }
+}
+
 type JobLane = 'image' | 'video'
-type QueuedJob = ThumbnailJob & { priority: MediaJobPriority; sequence: number }
+type ScheduledPayload =
+  | ({ kind: 'thumbnail' } & ThumbnailJob)
+  | ({ kind: 'background' } & BackgroundMediaJob)
+type QueuedJob = ScheduledPayload & { priority: MediaJobPriority; sequence: number }
 
 interface LaneQueues {
   high: QueuedJob[]
@@ -54,10 +73,11 @@ export class PriorityMediaScheduler {
     video: { high: [], low: [] }
   }
   private readonly pending = new Map<string, QueuedJob>()
-  private readonly pendingById = new Map<string, Set<QueuedJob>>()
+  private readonly pendingThumbnailsById = new Map<string, Set<QueuedJob>>()
   private readonly active = new Map<string, ActiveJob>()
   private readonly progress = new Map<number, GenerationProgress>()
   private readonly cancelledGenerations = new Set<number>()
+  private readonly cancelledBackgroundGroups = new Set<string>()
   private visibleIds = new Set<string>()
   private sequence = 0
   private runningImages = 0
@@ -69,18 +89,19 @@ export class PriorityMediaScheduler {
   enqueue(job: ThumbnailJob, priority: MediaJobPriority = 'low'): boolean {
     if (this.shuttingDown || this.cancelledGenerations.has(job.generation)) return false
 
-    const key = this.keyFor(job)
-    if (this.pending.has(key) || this.active.has(key)) return false
-
     const queuedJob: QueuedJob = {
+      kind: 'thumbnail',
       ...job,
       priority: this.visibleIds.has(job.id) ? 'high' : priority,
       sequence: this.sequence++
     }
+    const key = this.keyFor(queuedJob)
+    if (this.pending.has(key) || this.active.has(key)) return false
+
     this.pending.set(key, queuedJob)
-    const jobsForId = this.pendingById.get(job.id) ?? new Set<QueuedJob>()
+    const jobsForId = this.pendingThumbnailsById.get(job.id) ?? new Set<QueuedJob>()
     jobsForId.add(queuedJob)
-    this.pendingById.set(job.id, jobsForId)
+    this.pendingThumbnailsById.set(job.id, jobsForId)
     this.queues[this.laneFor(job.type)][queuedJob.priority].push(queuedJob)
 
     const generationProgress = this.progress.get(job.generation) ?? { current: 0, total: 0 }
@@ -90,13 +111,31 @@ export class PriorityMediaScheduler {
     return true
   }
 
+  enqueueBackground(job: BackgroundMediaJob): boolean {
+    if (this.shuttingDown || this.cancelledBackgroundGroups.has(job.groupId)) return false
+
+    const queuedJob: QueuedJob = {
+      kind: 'background',
+      ...job,
+      priority: 'low',
+      sequence: this.sequence++
+    }
+    const key = this.keyFor(queuedJob)
+    if (this.pending.has(key) || this.active.has(key)) return false
+
+    this.pending.set(key, queuedJob)
+    this.queues[this.laneFor(job.type)].low.push(queuedJob)
+    this.drain()
+    return true
+  }
+
   updateVisibleIds(ids: readonly string[]): void {
     this.visibleIds = new Set(ids)
     for (const id of this.visibleIds) {
-      const jobs = this.pendingById.get(id)
+      const jobs = this.pendingThumbnailsById.get(id)
       if (!jobs) continue
       for (const job of jobs) {
-        if (job.priority !== 'high') {
+        if (job.kind === 'thumbnail' && job.priority !== 'high') {
           job.priority = 'high'
           this.queues[this.laneFor(job.type)].high.push(job)
         }
@@ -113,24 +152,47 @@ export class PriorityMediaScheduler {
   cancelGeneration(generation: number): void {
     this.cancelledGenerations.add(generation)
     for (const [key, job] of this.pending) {
-      if (job.generation === generation) {
+      if (job.kind === 'thumbnail' && job.generation === generation) {
         this.pending.delete(key)
-        this.removePendingById(job)
+        this.removePendingThumbnail(job)
       }
     }
     for (const activeJob of this.active.values()) {
-      if (activeJob.job.generation === generation) activeJob.controller.abort()
+      if (activeJob.job.kind === 'thumbnail' && activeJob.job.generation === generation) {
+        activeJob.controller.abort()
+      }
     }
     this.progress.delete(generation)
+    this.drain()
+  }
+
+  cancelBackgroundGroup(groupId: string): void {
+    this.cancelledBackgroundGroups.add(groupId)
+    const cancellation = new MediaJobCancelledError()
+    for (const [key, job] of this.pending) {
+      if (job.kind === 'background' && job.groupId === groupId) {
+        this.pending.delete(key)
+        this.notifyBackgroundSettled(job, cancellation)
+      }
+    }
+    for (const activeJob of this.active.values()) {
+      if (activeJob.job.kind === 'background' && activeJob.job.groupId === groupId) {
+        activeJob.controller.abort()
+      }
+    }
     this.drain()
   }
 
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
+    const cancellation = new MediaJobCancelledError('Media scheduler is shutting down.')
+    for (const job of this.pending.values()) {
+      if (job.kind === 'background') this.notifyBackgroundSettled(job, cancellation)
+    }
     for (const activeJob of this.active.values()) activeJob.controller.abort()
     this.pending.clear()
-    this.pendingById.clear()
+    this.pendingThumbnailsById.clear()
     await Promise.allSettled(Array.from(this.active.values(), (activeJob) => activeJob.promise))
     this.active.clear()
   }
@@ -166,7 +228,7 @@ export class PriorityMediaScheduler {
         const key = this.keyFor(job)
         if (this.pending.get(key) !== job || job.priority !== priority) continue
         this.pending.delete(key)
-        this.removePendingById(job)
+        if (job.kind === 'thumbnail') this.removePendingThumbnail(job)
         return job
       }
     }
@@ -185,36 +247,57 @@ export class PriorityMediaScheduler {
   }
 
   private async run(job: QueuedJob, controller: AbortController): Promise<void> {
+    let error: unknown | null = null
     let thumbnailPath: string | null = null
     try {
-      thumbnailPath = await generateThumbnail(job.sourcePath, job.type, { signal: controller.signal })
-    } catch {
-      thumbnailPath = null
+      if (job.kind === 'thumbnail') {
+        thumbnailPath = await generateThumbnail(job.sourcePath, job.type, {
+          signal: controller.signal
+        })
+      } else {
+        await job.execute(controller.signal)
+      }
+    } catch (caughtError) {
+      error = controller.signal.aborted ? new MediaJobCancelledError() : caughtError
     } finally {
       this.active.delete(this.keyFor(job))
       if (job.type === 'image') this.runningImages--
       else this.runningVideos--
 
-      const generationProgress = this.progress.get(job.generation)
-      const cancelled = this.cancelledGenerations.has(job.generation) || this.shuttingDown
-      if (generationProgress) {
-        generationProgress.current++
-        if (!cancelled) this.callbacks.onProgress({ generation: job.generation, ...generationProgress })
+      if (job.kind === 'thumbnail') {
+        const generationProgress = this.progress.get(job.generation)
+        const cancelled = this.cancelledGenerations.has(job.generation) || this.shuttingDown
+        if (generationProgress) {
+          generationProgress.current++
+          if (!cancelled) this.callbacks.onProgress({ generation: job.generation, ...generationProgress })
+        }
+        if (!cancelled) this.callbacks.onComplete({ job, thumbnailPath: error ? null : thumbnailPath })
+      } else {
+        this.notifyBackgroundSettled(job, error)
       }
-      if (!cancelled) this.callbacks.onComplete({ job, thumbnailPath })
       this.drain()
     }
   }
 
-  private removePendingById(job: QueuedJob): void {
-    const jobs = this.pendingById.get(job.id)
-    if (!jobs) return
-    jobs.delete(job)
-    if (jobs.size === 0) this.pendingById.delete(job.id)
+  private notifyBackgroundSettled(job: BackgroundMediaJob, error: unknown | null): void {
+    try {
+      job.onSettled(error)
+    } catch {
+      // Completion observers must not compromise scheduler capacity accounting.
+    }
   }
 
-  private keyFor(job: ThumbnailJob): string {
-    return `${job.generation}\0${job.id}`
+  private removePendingThumbnail(job: ThumbnailJob): void {
+    const jobs = this.pendingThumbnailsById.get(job.id)
+    if (!jobs) return
+    jobs.delete(job as QueuedJob)
+    if (jobs.size === 0) this.pendingThumbnailsById.delete(job.id)
+  }
+
+  private keyFor(job: ScheduledPayload): string {
+    return job.kind === 'thumbnail'
+      ? `thumbnail:${job.generation}\0${job.id}`
+      : `background:${job.jobId}`
   }
 
   private laneFor(type: MediaType): JobLane {

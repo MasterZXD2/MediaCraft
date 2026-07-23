@@ -1,10 +1,20 @@
 import { create } from 'zustand'
-import type { CatalogStreamEvent } from '../../../shared/catalog'
+import type { CatalogSortBy, CatalogStreamEvent } from '../../../shared/catalog'
 import type { MediaFile } from '../../../shared/media'
 import type { DuplicateProgressPhase } from '../../../shared/duplicates'
+import type {
+  TransformBatchOptions,
+  TransformProgressData
+} from '../../../shared/transform'
 
 export type MediaFilter = 'all' | 'images' | 'videos' | 'duplicates' | 'trash'
 export type MediaStatus = 'active' | 'trash'
+export type MediaViewMode = 'grid' | 'list'
+
+export interface SelectionModifiers {
+  toggle?: boolean
+  range?: boolean
+}
 
 export interface MediaFileData extends MediaFile {
   id: string
@@ -32,8 +42,13 @@ export interface MediaState extends NormalizedMedia {
   datasetRoot: string
   activeRequestId: string | null
   activeFilter: MediaFilter
-  selectedId: string | null
+  searchQuery: string
+  sortBy: CatalogSortBy
+  viewMode: MediaViewMode
+  selectedIds: Set<string>
+  selectionAnchorId: string | null
   isLoading: boolean
+  isCatalogQuerying: boolean
   isProcessing: boolean
   progressCurrent: number
   progressTotal: number
@@ -48,16 +63,31 @@ export interface MediaState extends NormalizedMedia {
   isEmptyingTrash: boolean
   isResolvingDuplicateGroup: boolean
   cleanupError: string | null
+  isTransformStarting: boolean
+  isTransforming: boolean
+  transformBatchId: string | null
+  transformingIds: Set<string>
+  transformProgress: number
+  transformCompleted: number
+  transformTotal: number
+  transformError: string | null
   error: string | null
   setDatasetRoot: (path: string) => void
   setMediaFiles: (files: MediaFile[]) => void
-  setSelectedId: (id: string | null) => void
+  selectMedia: (id: string, modifiers?: SelectionModifiers) => void
+  clearSelection: () => void
   setActiveFilter: (filter: MediaFilter) => void
+  setSearchQuery: (query: string) => void
+  setSortBy: (sort: CatalogSortBy) => void
+  setViewMode: (mode: MediaViewMode) => void
+  refreshCatalogView: () => Promise<void>
   runDuplicateDetection: () => Promise<void>
   moveToTrash: (id: string) => Promise<void>
   restoreFromTrash: (id: string) => Promise<void>
   emptyTrash: () => Promise<void>
   resolveDuplicateGroup: (groupId: string) => Promise<void>
+  startTransform: (options: TransformBatchOptions) => Promise<boolean>
+  cancelTransform: () => Promise<void>
   loadDirectory: (path: string) => Promise<void>
 }
 
@@ -66,6 +96,12 @@ const pendingRemovedIds = new Set<string>()
 const optimisticallyTrashedIds = new Set<string>()
 const optimisticallyRestoredIds = new Set<string>()
 let suppressTrashCatalogChunks = false
+const bufferedTransformEvents = new Map<string, Map<string, TransformProgressData>>()
+const transformProgressById = new Map<string, number>()
+const terminalTransformIds = new Set<string>()
+let transformProgressSum = 0
+let catalogSearchTimer: ReturnType<typeof setTimeout> | null = null
+let pendingCatalogRefresh = false
 
 function emptyById(): Record<string, MediaFileData> {
   return Object.create(null) as Record<string, MediaFileData>
@@ -135,7 +171,6 @@ function normalizeMediaFiles(
   normalized.totalImages = normalized.imageIds.length
   normalized.totalVideos = normalized.videoIds.length
   normalized.totalDuplicates = normalized.duplicateIds.length
-  normalized.duplicateIds = sortedDuplicateIds(normalized.duplicateIds, normalized.byId)
   return normalized
 }
 
@@ -157,19 +192,6 @@ function matchesFilter(file: MediaFileData | undefined, filter: MediaFilter): bo
 function removeId(ids: string[], id: string): void {
   const index = ids.indexOf(id)
   if (index >= 0) ids.splice(index, 1)
-}
-
-function sortedDuplicateIds(
-  ids: string[],
-  byId: Record<string, MediaFileData>
-): string[] {
-  return ids.slice().sort((leftId, rightId) => {
-    const left = byId[leftId]
-    const right = byId[rightId]
-    const groupOrder = (left?.duplicateGroupId ?? '').localeCompare(right?.duplicateGroupId ?? '')
-    if (groupOrder !== 0) return groupOrder
-    return (left?.filename ?? leftId).localeCompare(right?.filename ?? rightId)
-  })
 }
 
 function insertAt<T>(items: T[], index: number, value: T): T[] {
@@ -207,13 +229,50 @@ export const selectActiveMediaCount = (state: MediaState): number => {
   return state.itemCount
 }
 
+function filterSelection(
+  selectedIds: ReadonlySet<string>,
+  byId: Record<string, MediaFileData>,
+  filter: MediaFilter
+): Set<string> {
+  const filtered = new Set<string>()
+  for (const id of selectedIds) {
+    if (matchesFilter(byId[id], filter)) filtered.add(id)
+  }
+  return filtered
+}
+
+function selectionWithout(selectedIds: ReadonlySet<string>, ids: ReadonlySet<string>): Set<string> {
+  const next = new Set(selectedIds)
+  for (const id of ids) next.delete(id)
+  return next
+}
+
+function scheduleCatalogRefresh(delayMs: number): void {
+  if (catalogSearchTimer) clearTimeout(catalogSearchTimer)
+  catalogSearchTimer = setTimeout(() => {
+    catalogSearchTimer = null
+    const state = useMediaStore.getState()
+    if (!state.datasetRoot) return
+    if (state.isLoading && !state.isCatalogQuerying) {
+      pendingCatalogRefresh = true
+      return
+    }
+    void state.refreshCatalogView()
+  }, delayMs)
+}
+
 export const useMediaStore = create<MediaState>((set, get) => ({
   ...emptyMedia(),
   datasetRoot: '',
   activeRequestId: null,
   activeFilter: 'all',
-  selectedId: null,
+  searchQuery: '',
+  sortBy: 'date_desc',
+  viewMode: 'grid',
+  selectedIds: new Set<string>(),
+  selectionAnchorId: null,
   isLoading: false,
+  isCatalogQuerying: false,
   isProcessing: false,
   progressCurrent: 0,
   progressTotal: 0,
@@ -228,30 +287,109 @@ export const useMediaStore = create<MediaState>((set, get) => ({
   isEmptyingTrash: false,
   isResolvingDuplicateGroup: false,
   cleanupError: null,
+  isTransformStarting: false,
+  isTransforming: false,
+  transformBatchId: null,
+  transformingIds: new Set<string>(),
+  transformProgress: 0,
+  transformCompleted: 0,
+  transformTotal: 0,
+  transformError: null,
   error: null,
   setDatasetRoot: (datasetRoot) => set({ datasetRoot }),
   setMediaFiles: (files) => set((state) => {
     const normalized = normalizeMediaFiles(files, state.byId)
     return {
       ...normalized,
-      selectedId: matchesFilter(
-        state.selectedId ? normalized.byId[state.selectedId] : undefined,
-        state.activeFilter
-      ) ? state.selectedId : null
+      selectedIds: filterSelection(state.selectedIds, normalized.byId, state.activeFilter),
+      selectionAnchorId: state.selectionAnchorId && normalized.byId[state.selectionAnchorId]
+        ? state.selectionAnchorId
+        : null
     }
   }),
-  setSelectedId: (selectedId) => set((state) => ({
-    selectedId: selectedId && matchesFilter(state.byId[selectedId], state.activeFilter)
-      ? selectedId
-      : null
-  })),
-  setActiveFilter: (activeFilter) => set((state) => ({
-    activeFilter,
-    selectedId: matchesFilter(
-      state.selectedId ? state.byId[state.selectedId] : undefined,
-      activeFilter
-    ) ? state.selectedId : null
-  })),
+  selectMedia: (id, modifiers = {}) => set((state) => {
+    if (!matchesFilter(state.byId[id], state.activeFilter)) return state
+    const activeIds = selectActiveMediaIds(state)
+
+    if (modifiers.range && state.selectionAnchorId) {
+      const anchorIndex = activeIds.indexOf(state.selectionAnchorId)
+      const targetIndex = activeIds.indexOf(id)
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const rangeIds = activeIds.slice(
+          Math.min(anchorIndex, targetIndex),
+          Math.max(anchorIndex, targetIndex) + 1
+        )
+        const selectedIds = modifiers.toggle ? new Set(state.selectedIds) : new Set<string>()
+        for (const rangeId of rangeIds) selectedIds.add(rangeId)
+        return { selectedIds }
+      }
+    }
+
+    if (modifiers.toggle) {
+      const selectedIds = new Set(state.selectedIds)
+      if (selectedIds.has(id)) selectedIds.delete(id)
+      else selectedIds.add(id)
+      return { selectedIds, selectionAnchorId: id }
+    }
+
+    return { selectedIds: new Set([id]), selectionAnchorId: id }
+  }),
+  clearSelection: () => set({ selectedIds: new Set<string>(), selectionAnchorId: null }),
+  setActiveFilter: (activeFilter) => set((state) => {
+    const selectedIds = filterSelection(state.selectedIds, state.byId, activeFilter)
+    return {
+      activeFilter,
+      selectedIds,
+      selectionAnchorId: state.selectionAnchorId && selectedIds.has(state.selectionAnchorId)
+        ? state.selectionAnchorId
+        : null
+    }
+  }),
+  setSearchQuery: (searchQuery) => {
+    const boundedQuery = searchQuery.slice(0, 256)
+    if (get().searchQuery === boundedQuery) return
+    set({ searchQuery: boundedQuery })
+    scheduleCatalogRefresh(300)
+  },
+  setSortBy: (sortBy) => {
+    if (get().sortBy === sortBy) return
+    set({ sortBy })
+    scheduleCatalogRefresh(0)
+  },
+  setViewMode: (viewMode) => set({ viewMode }),
+  refreshCatalogView: async () => {
+    const state = get()
+    if (!state.datasetRoot) return
+    if (state.isLoading && !state.isCatalogQuerying) {
+      pendingCatalogRefresh = true
+      return
+    }
+
+    const requestId = crypto.randomUUID()
+    const folderPath = state.datasetRoot
+    pendingCatalogRefresh = false
+    set({
+      activeRequestId: requestId,
+      isLoading: true,
+      isCatalogQuerying: true,
+      error: null
+    })
+    try {
+      await window.api.queryCatalog({
+        requestId,
+        folderPath,
+        searchQuery: get().searchQuery,
+        sortBy: get().sortBy
+      })
+    } catch (error) {
+      if (get().activeRequestId !== requestId) return
+      set({
+        isLoading: false,
+        isCatalogQuerying: false,
+        error: error instanceof Error ? error.message : 'Unable to query the media catalog.'
+      })
+    }
+  },
   runDuplicateDetection: async () => {
     const folderPath = get().datasetRoot
     if (!folderPath || get().isFindingDuplicates) return
@@ -270,11 +408,13 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       if (get().datasetRoot !== folderPath) return
       set({
         activeFilter: 'duplicates',
-        selectedId: null,
+        selectedIds: new Set<string>(),
+        selectionAnchorId: null,
         isFindingDuplicates: false,
         duplicatePhase: 'complete',
         duplicateMessage: 'Duplicate detection complete.'
       })
+      await get().refreshCatalogView()
     } catch (error) {
       if (get().datasetRoot !== folderPath) return
       set({
@@ -313,7 +453,8 @@ export const useMediaStore = create<MediaState>((set, get) => ({
         totalDuplicates: Math.max(0, current.totalDuplicates - (file.duplicateGroupId ? 1 : 0)),
         totalTrash: current.totalTrash + 1,
         totalTrashSize: current.totalTrashSize + file.size,
-        selectedId: current.selectedId === id ? null : current.selectedId,
+        selectedIds: selectionWithout(current.selectedIds, new Set([id])),
+        selectionAnchorId: current.selectionAnchorId === id ? null : current.selectionAnchorId,
         isTrashing: true,
         cleanupError: null
       }
@@ -337,14 +478,16 @@ export const useMediaStore = create<MediaState>((set, get) => ({
           byId: current.byId,
           duplicateIds,
           totalDuplicates: duplicateIds.length,
-          selectedId: current.activeFilter === 'duplicates'
-            && current.selectedId
-            && clearedIds.has(current.selectedId)
+          selectedIds: current.activeFilter === 'duplicates'
+            ? selectionWithout(current.selectedIds, clearedIds)
+            : current.selectedIds,
+          selectionAnchorId: current.selectionAnchorId && clearedIds.has(current.selectionAnchorId)
             ? null
-            : current.selectedId,
+            : current.selectionAnchorId,
           isTrashing: false
         }
       })
+      scheduleCatalogRefresh(300)
     } catch (error) {
       optimisticallyTrashedIds.delete(id)
       set((current) => {
@@ -403,7 +546,8 @@ export const useMediaStore = create<MediaState>((set, get) => ({
         totalVideos: current.totalVideos + (file.type === 'video' ? 1 : 0),
         totalTrash: Math.max(0, current.totalTrash - 1),
         totalTrashSize: Math.max(0, current.totalTrashSize - file.size),
-        selectedId: current.selectedId === id ? null : current.selectedId,
+        selectedIds: selectionWithout(current.selectedIds, new Set([id])),
+        selectionAnchorId: current.selectionAnchorId === id ? null : current.selectionAnchorId,
         isRestoring: true,
         cleanupError: null
       }
@@ -413,6 +557,7 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       const changed = await window.api.restoreFromTrash(id)
       if (!changed) throw new Error('The media item is no longer in trash.')
       set({ isRestoring: false })
+      scheduleCatalogRefresh(300)
     } catch (error) {
       optimisticallyRestoredIds.delete(id)
       set((current) => {
@@ -444,7 +589,7 @@ export const useMediaStore = create<MediaState>((set, get) => ({
   },
   emptyTrash: async () => {
     const state = get()
-    if (!state.datasetRoot || state.totalTrash === 0 || state.isEmptyingTrash) return
+    if (!state.datasetRoot || state.totalTrash === 0 || state.isEmptyingTrash || state.isLoading) return
 
     const snapshot = new Map(
       state.trashIds.flatMap((id) => state.byId[id] ? [[id, state.byId[id]] as const] : [])
@@ -457,7 +602,10 @@ export const useMediaStore = create<MediaState>((set, get) => ({
         trashIds: [],
         totalTrash: 0,
         totalTrashSize: 0,
-        selectedId: current.activeFilter === 'trash' ? null : current.selectedId,
+        selectedIds: current.activeFilter === 'trash'
+          ? new Set<string>()
+          : current.selectedIds,
+        selectionAnchorId: current.activeFilter === 'trash' ? null : current.selectionAnchorId,
         isEmptyingTrash: true,
         cleanupError: null
       }
@@ -493,6 +641,7 @@ export const useMediaStore = create<MediaState>((set, get) => ({
           pendingThumbnailUrls.delete(id)
         }
       }
+      scheduleCatalogRefresh(300)
     } catch (error) {
       suppressTrashCatalogChunks = false
       set((current) => {
@@ -515,14 +664,19 @@ export const useMediaStore = create<MediaState>((set, get) => ({
   },
   resolveDuplicateGroup: async (groupId) => {
     const state = get()
-    if (state.isResolvingDuplicateGroup) return
+    if (state.isResolvingDuplicateGroup || state.isLoading) return
     const files = state.duplicateIds
       .map((id) => state.byId[id])
       .filter((file): file is MediaFileData => file?.duplicateGroupId === groupId && file.status === 'active')
     const keepId = bestMediaId(files)
     if (!keepId || files.length < 2) return
 
-    set({ isResolvingDuplicateGroup: true, selectedId: keepId, cleanupError: null })
+    set({
+      isResolvingDuplicateGroup: true,
+      selectedIds: new Set([keepId]),
+      selectionAnchorId: keepId,
+      cleanupError: null
+    })
     try {
       for (const file of files) {
         if (file.id !== keepId) await get().moveToTrash(file.id)
@@ -531,7 +685,71 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       set({ isResolvingDuplicateGroup: false })
     }
   },
+  startTransform: async (options) => {
+    const state = get()
+    if (state.isTransformStarting || state.isTransforming) return false
+    const fileIds = Array.from(state.selectedIds).filter((id) => state.byId[id]?.status === 'active')
+    if (fileIds.length === 0) {
+      set({ transformError: 'Select at least one active media item.' })
+      return false
+    }
+
+    set({ isTransformStarting: true, transformError: null })
+    try {
+      const outputDirectory = await window.api.selectTransformOutputDirectory()
+      if (!outputDirectory) {
+        set({ isTransformStarting: false })
+        return false
+      }
+
+      const accepted = await window.api.transformMedia({ fileIds, options, outputDirectory })
+      transformProgressById.clear()
+      terminalTransformIds.clear()
+      transformProgressSum = 0
+      set({
+        isTransformStarting: false,
+        isTransforming: accepted.accepted > 0,
+        transformBatchId: accepted.batchId,
+        transformingIds: new Set(fileIds),
+        transformProgress: 0,
+        transformCompleted: 0,
+        transformTotal: accepted.accepted,
+        transformError: null
+      })
+
+      const buffered = bufferedTransformEvents.get(accepted.batchId)
+      bufferedTransformEvents.delete(accepted.batchId)
+      if (buffered) {
+        for (const progress of buffered.values()) applyTransformProgress(progress)
+      }
+      trimBufferedTransformEvents(accepted.batchId)
+      return true
+    } catch (error) {
+      set({
+        isTransformStarting: false,
+        isTransforming: false,
+        transformError: error instanceof Error ? error.message : 'Unable to start transformation.'
+      })
+      return false
+    }
+  },
+  cancelTransform: async () => {
+    const batchId = get().transformBatchId
+    if (!batchId || !get().isTransforming) return
+    try {
+      await window.api.cancelTransform(batchId)
+    } catch (error) {
+      set({
+        transformError: error instanceof Error ? error.message : 'Unable to cancel transformation.'
+      })
+    }
+  },
   loadDirectory: async (path) => {
+    if (catalogSearchTimer) {
+      clearTimeout(catalogSearchTimer)
+      catalogSearchTimer = null
+    }
+    pendingCatalogRefresh = true
     pendingThumbnailUrls.clear()
     pendingRemovedIds.clear()
     optimisticallyTrashedIds.clear()
@@ -542,8 +760,11 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       datasetRoot: path,
       activeRequestId: null,
       activeFilter: 'all',
-      selectedId: null,
+      searchQuery: '',
+      selectedIds: new Set<string>(),
+      selectionAnchorId: null,
       isLoading: true,
+      isCatalogQuerying: false,
       isProcessing: false,
       progressCurrent: 0,
       progressTotal: 0,
@@ -558,6 +779,7 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       isEmptyingTrash: false,
       isResolvingDuplicateGroup: false,
       cleanupError: null,
+      transformError: null,
       error: null
     })
 
@@ -600,6 +822,70 @@ window.api.onProgressUpdate(({ current, total }) => {
   })
 })
 
+function applyTransformProgress(progress: TransformProgressData): void {
+  const state = useMediaStore.getState()
+  if (state.transformBatchId !== progress.batchId) return
+
+  const terminal = progress.status === 'complete'
+    || progress.status === 'error'
+    || progress.status === 'cancelled'
+  const nextProgress = terminal ? 100 : Math.max(0, Math.min(100, progress.progress))
+  const previousProgress = transformProgressById.get(progress.fileId) ?? 0
+  transformProgressById.set(progress.fileId, nextProgress)
+  transformProgressSum += nextProgress - previousProgress
+
+  let completed = state.transformCompleted
+  let transformingIds = state.transformingIds
+  if (terminal && !terminalTransformIds.has(progress.fileId)) {
+    terminalTransformIds.add(progress.fileId)
+    completed++
+    transformingIds = new Set(state.transformingIds)
+    transformingIds.delete(progress.fileId)
+  }
+
+  const isTransforming = completed < state.transformTotal
+  useMediaStore.setState({
+    isTransforming,
+    transformBatchId: isTransforming ? state.transformBatchId : null,
+    transformingIds,
+    transformProgress: state.transformTotal > 0
+      ? Math.min(100, transformProgressSum / state.transformTotal)
+      : 0,
+    transformCompleted: completed,
+    ...(progress.status === 'error' && progress.error
+      ? { transformError: progress.error }
+      : {})
+  })
+}
+
+function bufferTransformProgress(progress: TransformProgressData): void {
+  let batch = bufferedTransformEvents.get(progress.batchId)
+  if (!batch) {
+    batch = new Map<string, TransformProgressData>()
+    bufferedTransformEvents.set(progress.batchId, batch)
+  }
+  batch.set(progress.fileId, progress)
+  while (bufferedTransformEvents.size > 10) {
+    const oldestBatchId = bufferedTransformEvents.keys().next().value as string | undefined
+    if (!oldestBatchId) break
+    bufferedTransformEvents.delete(oldestBatchId)
+  }
+}
+
+function trimBufferedTransformEvents(activeBatchId: string): void {
+  for (const batchId of bufferedTransformEvents.keys()) {
+    if (batchId !== activeBatchId) bufferedTransformEvents.delete(batchId)
+  }
+}
+
+window.api.onTransformProgress((progress) => {
+  if (useMediaStore.getState().transformBatchId === progress.batchId) {
+    applyTransformProgress(progress)
+  } else {
+    bufferTransformProgress(progress)
+  }
+})
+
 window.api.onDuplicateProgress((progress) => {
   useMediaStore.setState((state) => {
     if (state.datasetRoot !== progress.folderPath) return state
@@ -634,11 +920,17 @@ window.api.onDuplicateGroupsUpdated((update) => {
       state.byId[file.id] = { ...file, duplicateGroupId: assignment.groupId }
     }
 
-    if (update.complete) duplicateIds = sortedDuplicateIds(duplicateIds, state.byId)
+    const selectedIds = state.activeFilter === 'duplicates'
+      ? filterSelection(state.selectedIds, state.byId, state.activeFilter)
+      : state.selectedIds
     return {
       byId: state.byId,
       duplicateIds,
-      totalDuplicates: duplicateIds.length
+      totalDuplicates: duplicateIds.length,
+      selectedIds,
+      selectionAnchorId: state.selectionAnchorId && selectedIds.has(state.selectionAnchorId)
+        ? state.selectionAnchorId
+        : null
     }
   })
 })
@@ -648,6 +940,11 @@ window.api.onCatalogEvent((event) => {
     if (!acceptsCatalogEvent(state, event)) return state
 
     if (event.type === 'reset') {
+      if (event.operation === 'query') {
+        for (const file of Object.values(state.byId)) {
+          if (file.thumbnailUrl) pendingThumbnailUrls.set(file.id, file.thumbnailUrl)
+        }
+      }
       pendingRemovedIds.clear()
       optimisticallyTrashedIds.clear()
       optimisticallyRestoredIds.clear()
@@ -655,8 +952,10 @@ window.api.onCatalogEvent((event) => {
       return {
         ...emptyMedia(),
         activeRequestId: event.requestId,
-        selectedId: null,
+        selectedIds: new Set<string>(),
+        selectionAnchorId: null,
         isLoading: true,
+        isCatalogQuerying: event.operation === 'query',
         error: null
       }
     }
@@ -694,6 +993,7 @@ window.api.onCatalogEvent((event) => {
         }
         state.byId[id] = media
       }
+      const selectedIds = filterSelection(state.selectedIds, state.byId, state.activeFilter)
 
       return {
         byId: state.byId,
@@ -709,6 +1009,10 @@ window.api.onCatalogEvent((event) => {
         totalDuplicates: state.totalDuplicates,
         totalTrash,
         totalTrashSize,
+        selectedIds,
+        selectionAnchorId: state.selectionAnchorId && selectedIds.has(state.selectionAnchorId)
+          ? state.selectionAnchorId
+          : null,
         activeRequestId: event.requestId
       }
     }
@@ -778,6 +1082,7 @@ window.api.onCatalogEvent((event) => {
 
         state.byId[id] = media
       }
+      const selectedIds = filterSelection(state.selectedIds, state.byId, state.activeFilter)
 
       return {
         byId: state.byId,
@@ -793,15 +1098,20 @@ window.api.onCatalogEvent((event) => {
         totalDuplicates,
         totalTrash,
         totalTrashSize,
+        selectedIds,
+        selectionAnchorId: state.selectionAnchorId && selectedIds.has(state.selectionAnchorId)
+          ? state.selectionAnchorId
+          : null,
         activeRequestId: event.requestId,
-        isLoading: false,
+        isLoading: true,
         error: null
       }
     }
 
     if (event.type === 'remove') {
       let totalSize = state.totalSize
-      let selectedId = state.selectedId
+      const selectedIds = new Set(state.selectedIds)
+      let selectionAnchorId = state.selectionAnchorId
       for (const id of event.ids) {
         const existing = state.byId[id]
         if (!existing) continue
@@ -813,7 +1123,8 @@ window.api.onCatalogEvent((event) => {
         }
         delete state.byId[id]
         pendingRemovedIds.add(id)
-        if (selectedId === id) selectedId = null
+        selectedIds.delete(id)
+        if (selectionAnchorId === id) selectionAnchorId = null
       }
 
       return {
@@ -822,7 +1133,8 @@ window.api.onCatalogEvent((event) => {
         trashIds: state.trashIds,
         totalTrash: state.totalTrash,
         totalTrashSize: state.totalTrashSize,
-        selectedId,
+        selectedIds,
+        selectionAnchorId,
         activeRequestId: event.requestId
       }
     }
@@ -841,11 +1153,15 @@ window.api.onCatalogEvent((event) => {
       const videoIds = hasRemovals
         ? state.videoIds.filter((id) => !pendingRemovedIds.has(id))
         : state.videoIds
-      const unsortedDuplicateIds = hasRemovals
+      const duplicateIds = hasRemovals
         ? state.duplicateIds.filter((id) => !pendingRemovedIds.has(id))
         : state.duplicateIds
-      const duplicateIds = sortedDuplicateIds(unsortedDuplicateIds, state.byId)
+      const selectedIds = filterSelection(state.selectedIds, state.byId, state.activeFilter)
       pendingRemovedIds.clear()
+      if (event.operation === 'scan') {
+        pendingCatalogRefresh = true
+        queueMicrotask(() => scheduleCatalogRefresh(0))
+      }
 
       return {
         allIds,
@@ -856,8 +1172,13 @@ window.api.onCatalogEvent((event) => {
         totalImages: imageIds.length,
         totalVideos: videoIds.length,
         totalDuplicates: duplicateIds.length,
+        selectedIds,
+        selectionAnchorId: state.selectionAnchorId && selectedIds.has(state.selectionAnchorId)
+          ? state.selectionAnchorId
+          : null,
         activeRequestId: event.requestId,
         isLoading: false,
+        isCatalogQuerying: false,
         error: null
       }
     }
@@ -865,6 +1186,7 @@ window.api.onCatalogEvent((event) => {
     if (event.type === 'error') return {
       activeRequestId: event.requestId,
       isLoading: false,
+      isCatalogQuerying: false,
       error: state.itemCount === 0 ? event.message : null
     }
 

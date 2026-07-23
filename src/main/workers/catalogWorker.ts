@@ -10,6 +10,7 @@ import {
   deleteTrashRecords,
   getDuplicateCandidatesPage,
   getFilesInFolderPage,
+  getMediaReferences,
   getTrashInFolderPage,
   getTrashPathsPage,
   markAsTrash,
@@ -19,7 +20,13 @@ import {
   upsertMediaFiles,
   type MediaFileData
 } from '../db/queries'
-import type { CatalogStreamEvent, CatalogWorkerCommand, CatalogWorkerMessage } from '../../shared/catalog'
+import type {
+  CatalogOperation,
+  CatalogQueryOptions,
+  CatalogStreamEvent,
+  CatalogWorkerCommand,
+  CatalogWorkerMessage
+} from '../../shared/catalog'
 import type { MediaFile, MediaType } from '../../shared/media'
 
 const CACHE_PAGE_SIZE = 750
@@ -30,6 +37,7 @@ const DUPLICATE_PAGE_SIZE = 500
 const TRASH_PATH_PAGE_SIZE = 250
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp'])
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.webm'])
+const DEFAULT_CATALOG_QUERY: CatalogQueryOptions = { searchQuery: '', sortBy: 'date_desc' }
 
 interface CatalogWorkerData {
   databasePath: string
@@ -46,6 +54,7 @@ if (!parentPort) throw new Error('Catalog worker requires a parent port.')
 const port = parentPort
 const data = workerData as CatalogWorkerData
 let activeRequestId: string | null = null
+let activeQueryRequestId: string | null = null
 let shuttingDown = false
 
 initializeDatabase(data.databasePath)
@@ -60,6 +69,17 @@ port.on('message', (message: CatalogWorkerCommand) => {
 
   if (message.type === 'cancel') {
     if (activeRequestId === message.requestId) activeRequestId = null
+    return
+  }
+
+  if (message.type === 'query-catalog') {
+    activeQueryRequestId = message.requestId
+    void runCatalogQuery(message.requestId, resolve(message.folderPath), message)
+    return
+  }
+
+  if (message.type === 'cancel-query') {
+    if (activeQueryRequestId === message.requestId) activeQueryRequestId = null
     return
   }
 
@@ -123,9 +143,20 @@ port.on('message', (message: CatalogWorkerCommand) => {
     return
   }
 
+  if (message.type === 'get-media-references') {
+    try {
+      const files = getMediaReferences(message.fileIds.map((fileId) => resolve(fileId)))
+      postMessage({ type: 'media-references-complete', requestId: message.requestId, files })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
   if (message.type === 'shutdown') {
     shuttingDown = true
     activeRequestId = null
+    activeQueryRequestId = null
     closeDatabase()
     postMessage({ type: 'shutdown-complete' })
     port.close()
@@ -182,11 +213,11 @@ async function runCatalogRequest(requestId: string, requestedPath: string): Prom
   const folderPath = resolve(requestedPath)
 
   try {
-    postEvent({ type: 'reset', requestId, folderPath })
-    await streamCachedFiles(requestId, folderPath)
+    postEvent({ type: 'reset', requestId, folderPath, operation: 'scan' })
+    await streamCachedFiles(requestId, folderPath, DEFAULT_CATALOG_QUERY, 'scan')
     if (!isActive(requestId)) return
 
-    await streamTrashedFiles(requestId, folderPath)
+    await streamTrashedFiles(requestId, folderPath, DEFAULT_CATALOG_QUERY, 'scan')
     if (!isActive(requestId)) return
 
     await synchronizeDirectory(requestId, folderPath)
@@ -196,6 +227,7 @@ async function runCatalogRequest(requestId: string, requestedPath: string): Prom
       type: 'complete',
       requestId,
       folderPath,
+      operation: 'scan',
       total: countFilesInFolder(folderPath)
     })
     activeRequestId = null
@@ -205,35 +237,91 @@ async function runCatalogRequest(requestId: string, requestedPath: string): Prom
       type: 'error',
       requestId,
       folderPath,
+      operation: 'scan',
       message: getErrorMessage(error)
     })
     activeRequestId = null
   }
 }
 
-async function streamTrashedFiles(requestId: string, folderPath: string): Promise<void> {
-  const total = countTrashInFolder(folderPath)
+async function runCatalogQuery(
+  requestId: string,
+  folderPath: string,
+  query: CatalogQueryOptions
+): Promise<void> {
+  try {
+    postEvent({ type: 'reset', requestId, folderPath, operation: 'query' })
+    await streamCachedFiles(requestId, folderPath, query, 'query')
+    if (!isQueryActive(requestId)) return
+    await streamTrashedFiles(requestId, folderPath, query, 'query')
+    if (!isQueryActive(requestId)) return
+
+    postEvent({
+      type: 'complete',
+      requestId,
+      folderPath,
+      operation: 'query',
+      total: countFilesInFolder(folderPath, query.searchQuery)
+    })
+    activeQueryRequestId = null
+  } catch (error) {
+    if (!isQueryActive(requestId)) return
+    postEvent({
+      type: 'error',
+      requestId,
+      folderPath,
+      operation: 'query',
+      message: getErrorMessage(error)
+    })
+    activeQueryRequestId = null
+  }
+}
+
+async function streamTrashedFiles(
+  requestId: string,
+  folderPath: string,
+  query: CatalogQueryOptions,
+  operation: CatalogOperation
+): Promise<void> {
+  const total = countTrashInFolder(folderPath, query.searchQuery)
 
   for (let offset = 0; offset < total; offset += CACHE_PAGE_SIZE) {
-    if (!isActive(requestId)) return
-    const files = getTrashInFolderPage(folderPath, CACHE_PAGE_SIZE, offset).map(toMediaFile)
+    if (!isOperationActive(requestId, operation)) return
+    const files = getTrashInFolderPage(
+      folderPath,
+      query.searchQuery,
+      query.sortBy,
+      CACHE_PAGE_SIZE,
+      offset
+    ).map(toMediaFile)
     if (files.length > 0) {
-      postEvent({ type: 'trash-chunk', requestId, folderPath, files })
+      postEvent({ type: 'trash-chunk', requestId, folderPath, operation, files })
     }
     await yieldToMessageLoop()
   }
 }
 
-async function streamCachedFiles(requestId: string, folderPath: string): Promise<void> {
-  const total = countFilesInFolder(folderPath)
+async function streamCachedFiles(
+  requestId: string,
+  folderPath: string,
+  query: CatalogQueryOptions,
+  operation: CatalogOperation
+): Promise<void> {
+  const total = countFilesInFolder(folderPath, query.searchQuery)
 
   for (let offset = 0; offset < total; offset += CACHE_PAGE_SIZE) {
-    if (!isActive(requestId)) return
-    const files = getFilesInFolderPage(folderPath, CACHE_PAGE_SIZE, offset)
+    if (!isOperationActive(requestId, operation)) return
+    const files = getFilesInFolderPage(
+      folderPath,
+      query.searchQuery,
+      query.sortBy,
+      CACHE_PAGE_SIZE,
+      offset
+    )
       .filter((file) => !isIgnoredFilesystemArtifactPath(folderPath, file.filePath))
       .map(toMediaFile)
     if (files.length > 0) {
-      postEvent({ type: 'chunk', requestId, folderPath, source: 'cache', files })
+      postEvent({ type: 'chunk', requestId, folderPath, operation, source: 'cache', files })
     }
     await yieldToMessageLoop()
   }
@@ -300,6 +388,7 @@ async function synchronizeDirectory(requestId: string, folderPath: string): Prom
       type: 'remove',
       requestId,
       folderPath,
+      operation: 'scan',
       ids: removedIds.slice(offset, offset + REMOVAL_CHUNK_SIZE)
     })
     await yieldToMessageLoop()
@@ -363,6 +452,7 @@ function flushScanChunk(
     type: 'chunk',
     requestId,
     folderPath,
+    operation: 'scan',
     source: 'scan',
     files: activeFiles.map(toMediaFile)
   })
@@ -411,6 +501,14 @@ function toMediaFile(file: MediaFileData): MediaFile {
 
 function isActive(requestId: string): boolean {
   return !shuttingDown && activeRequestId === requestId
+}
+
+function isQueryActive(requestId: string): boolean {
+  return !shuttingDown && activeQueryRequestId === requestId
+}
+
+function isOperationActive(requestId: string, operation: CatalogOperation): boolean {
+  return operation === 'scan' ? isActive(requestId) : isQueryActive(requestId)
 }
 
 function isMissingPathError(error: unknown): boolean {
