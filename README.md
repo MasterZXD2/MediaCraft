@@ -1,98 +1,77 @@
 # MediaCraft
 
-MediaCraft is an offline-first Electron desktop application for browsing and managing local image and video collections. It currently provides a secure three-pane media browser with recursive folder scanning, SQLite-backed scan caching, and asynchronous thumbnail generation.
+MediaCraft is an offline-first Electron desktop application for browsing and managing large local image and video collections. It keeps media on the local machine and exposes filesystem, SQLite, and media-processing capabilities only through the main process and a typed preload bridge.
 
-All media stays on the local machine. The renderer does not access Node.js or the filesystem directly.
+`project_goal.md` is the product source of truth. This README is the short operational context; [AGENTS.md](AGENTS.md) contains project-specific engineering boundaries and [Agent-Handoff.md](Agent-Handoff.md) contains the current implementation status and open work.
 
-## Current Features
+## Current State
 
-- Modern dark desktop UI built with React, Tailwind CSS, and shadcn-style components.
-- Native folder picker and recursive media scanning.
-- Supported images: `.jpg`, `.jpeg`, `.png`, and `.webp`.
-- Supported videos: `.mp4`, `.mkv`, `.mov`, and `.webm`.
-- Cache-first SQLite catalog for instant repeat loads.
-- Background filesystem reconciliation that adds new files and removes missing files.
-- Image thumbnails generated with Sharp.
-- Video frames extracted with FFmpeg through `fluent-ffmpeg`.
-- Two-worker asynchronous thumbnail queue to keep scanning responsive.
-- Modification-aware thumbnail and failure caching.
-- Secure `mediacraft-media://` protocol with per-scan file allowlisting.
-- Strict Electron context isolation and a typed preload bridge.
+The current tree contains the implemented foundation and the major workflows requested so far:
 
-## Planned Workflows
+- Three-pane dark UI built with React, Tailwind CSS, shadcn-style Radix primitives, and Lucide icons.
+- Recursive folder scanning with a cache-first SQLite catalog in a dedicated catalog worker.
+- Bounded filesystem traversal, scan generations, paged catalog events, folder-tree navigation, search, sort, grid/list modes, and normalized Zustand state.
+- Sharp/FFmpeg thumbnail generation with priority scheduling, secure `mediacraft-media://` serving, and atomic cache publication.
+- Duplicate detection with a hash worker pool, scoped scans, progress/debug events, and duplicate grouping.
+- Validation flags, soft trash, restore, and empty-trash support.
+- Transform jobs for image resizing/cropping/adjustments and video encode, remux, MP3 extraction, snapshots, mute, and visual trimming.
+- Sequential export planning with collision checks and bounded asynchronous copying.
+- Global tags with add/remove/rename/delete operations and tag filtering.
+- Full-screen keyboard-navigable media viewer with paused video playback, snapshots, visual trimming, and image crop/adjustment controls.
 
-The full product direction is documented in [project_goal.md](project_goal.md).
+These features are supported by the current source tree and the reported checks in [Agent-Handoff.md](Agent-Handoff.md). The application is still under active development; a passing build does not replace manual testing with representative media.
 
-| Workflow | Status | Scope |
-|---|---|---|
-| Curate | In progress | Scan, cache, browse, filter, and inspect local media. |
-| Clean Up | Planned | Validation, duplicate detection, review groups, and trash management. |
-| Transform | Planned | Image resizing and FFmpeg video re-encoding. |
-| Organize | Planned | Sequential renaming and structured export. |
+## Stack
 
-Duplicate detection, file transformation, deletion, export, virtualized grids, and complete media metadata extraction are not implemented yet.
-
-## Tech Stack
-
-- Electron 33 with `electron-vite`
+- Electron 43 with `electron-vite`
 - React 18 and TypeScript
 - Tailwind CSS and Radix/shadcn-style UI primitives
-- Zustand renderer state
-- `better-sqlite3` local catalog
-- Sharp image processing
-- `fluent-ffmpeg` video frame extraction
+- Zustand
+- `better-sqlite3` in the catalog worker
+- Sharp for image processing
+- Direct `ffmpeg`/`ffprobe` child-process wrapper for video work
+- `@tanstack/react-virtual` for the gallery
 - Lucide icons
 
-## Requirements
-
-- Node.js 22 or newer is recommended.
-- npm.
-- FFmpeg and FFprobe available on `PATH` for video thumbnails.
-
-Verify FFmpeg with:
-
-```powershell
-ffmpeg -version
-ffprobe -version
-```
-
-Image scanning and image thumbnails still work if FFmpeg is unavailable, but video thumbnails will remain placeholders.
-
-## Getting Started
-
-Install dependencies:
+## Start
 
 ```powershell
 npm install
-```
-
-The post-install script rebuilds `better-sqlite3` for Electron's native ABI. If the Electron version or native dependencies change, rebuild it manually:
-
-```powershell
-npm run rebuild:native
-```
-
-Start the desktop application:
-
-```powershell
 npm run dev
 ```
 
-Select a folder from the top bar. Cached database results appear immediately on later visits while MediaCraft validates the folder in the background.
+Useful checks:
 
-## Available Commands
+```powershell
+npm run typecheck
+npm run build
+npm run rebuild:native
+```
 
-| Command | Purpose |
-|---|---|
-| `npm run dev` | Start Electron with renderer hot reload. |
-| `npm run typecheck` | Type-check the main, preload, shared, and renderer code. |
-| `npm run build` | Type-check and build production bundles. |
-| `npm run preview` | Preview the production Electron build. |
-| `npm run rebuild:native` | Rebuild `better-sqlite3` for the installed Electron version. |
+FFmpeg and FFprobe must be available on `PATH` for video metadata, thumbnails, and transforms. Native `better-sqlite3` must be rebuilt after changing the Electron version or native dependencies.
 
-## Local Data
+## Architecture Map
 
-MediaCraft stores generated application data under Electron's platform-specific `userData` directory:
+```text
+src/
+|- main/
+|  |- db/              # SQLite lifecycle and prepared queries
+|  |- ipc/             # Feature-specific main-process controllers
+|  |- lib/             # Scanner, scheduler, media, duplicate, and export logic
+|  `- workers/         # Catalog and CPU hash workers
+|- preload/            # Typed contextBridge API
+|- renderer/src/
+|  |- components/      # Layout, curate, cleanup, transform, organize, UI
+|  |- hooks/            # Renderer-only hooks
+|  `- store/            # Normalized catalog and UI state
+`- shared/             # Serializable IPC contracts
+```
+
+The renderer must not import Node APIs or touch SQLite. Main-process handlers validate paths and input before forwarding work to workers or media libraries. The custom media protocol serves only files authorized by the active scan.
+
+## Data Locations
+
+Electron stores the catalog and thumbnail cache under the platform-specific `userData` directory:
 
 ```text
 <userData>/
@@ -102,72 +81,8 @@ MediaCraft stores generated application data under Electron's platform-specific 
 `- MediaCraft_Thumbnails/
 ```
 
-Thumbnail filenames are SHA-256 hashes of the source path, size, and modification time. Corrupt videos receive a matching `.failed` marker so FFmpeg is not repeatedly invoked. Changing the source file produces a new cache key and triggers another attempt.
+## Known Limits
 
-## Architecture
-
-```text
-src/
-|- main/
-|  |- db/
-|  |  |- index.ts          # SQLite lifecycle and schema
-|  |  `- queries.ts        # Prepared catalog queries and transactions
-|  |- ipc/
-|  |  `- scanner.ts        # Cache-first recursive scanner and reconciliation
-|  |- lib/
-|  |  `- thumbnail.ts      # Sharp/FFmpeg thumbnail generation
-|  `- index.ts             # Electron window, IPC, protocol, and queues
-|- preload/
-|  `- index.ts             # Typed contextBridge API
-|- renderer/
-|  |- index.html
-|  `- src/
-|     |- components/       # Three-pane layout and UI primitives
-|     |- store/            # Zustand media state
-|     `- App.tsx
-`- shared/
-   `- media.ts             # Shared serializable IPC contracts
-```
-
-The main process owns filesystem access, SQLite, Sharp, FFmpeg, cache paths, and protocol authorization. The preload exposes a narrow allowlisted API. The renderer receives serializable media records and event updates only.
-
-## Database Schema
-
-The `media_files` table stores:
-
-- Dataset root and unique file path.
-- Filename, media type, byte size, and modification timestamp.
-- Nullable width, height, duration, and FPS fields reserved for background metadata extraction.
-
-Folder lookups are indexed. Scan writes use prepared statements and transactions, and missing-file cleanup uses a temporary table so large datasets do not exceed SQLite parameter limits.
-
-## Troubleshooting
-
-### Video thumbnail remains a placeholder
-
-Confirm FFmpeg is installed and the file contains a decodable video frame. Incomplete recordings may contain MP4 stream headers but no video packets. MediaCraft records these failures and keeps the placeholder instead of retrying on every scan.
-
-### `better-sqlite3` reports a module ABI error
-
-Rebuild the native dependency for Electron:
-
-```powershell
-npm run rebuild:native
-```
-
-### A file was added or removed outside MediaCraft
-
-Select the dataset again. Cached records render first, followed by a background synchronization that updates the gallery and database.
-
-## Security
-
-- `contextIsolation` and the Electron sandbox are enabled.
-- The renderer never imports `fs`, `path`, SQLite, Sharp, or FFmpeg.
-- IPC channels are explicitly exposed through the preload bridge.
-- Folder scans must originate from the native folder picker.
-- Local media URLs are served through an allowlisted custom protocol.
-- Directory symlinks are not followed during scans.
-
-## Project Status
-
-MediaCraft is under active development. The current milestone covers the UI shell and the foundational Curate workflow: local scanning, SQLite caching, synchronization, and thumbnails.
+- The repository has no automated media-fixture test suite yet.
+- Native Electron visual QA was not completed in the last pass because the browser runtime could not write its kernel assets.
+- Real-world FFmpeg support still depends on the installed binary and the codecs/containers present in the user's files.

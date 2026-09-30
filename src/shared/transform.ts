@@ -3,6 +3,7 @@ import type { MediaType } from './media'
 export type ImageResizeMode = 'long_edge' | 'exact'
 export type ImageOutputFormat = 'source' | 'jpeg' | 'png' | 'webp' | 'avif'
 export type VideoCodec = 'libx264' | 'libx265'
+export type VideoTransformMode = 'encode' | 'remux' | 'extract_mp3' | 'snapshot' | 'trim' | 'mute_video'
 export type VideoPreset =
   | 'ultrafast'
   | 'superfast'
@@ -30,9 +31,31 @@ export interface ExactImageOptions {
   quality?: number
 }
 
-export type ImageTransformOptions = LongEdgeImageOptions | ExactImageOptions
+export interface CropImageOptions {
+  mode: 'crop'
+  cropRect: {
+    x: number
+    y: number
+    width: number
+    height: number
+  }
+  format: ImageOutputFormat
+  quality?: number
+}
 
-export interface VideoTransformOptions {
+export interface AdjustImageOptions {
+  mode: 'adjust_image'
+  rotate?: number
+  flipHorizontal?: boolean
+  flipVertical?: boolean
+  format: ImageOutputFormat
+  quality?: number
+}
+
+export type ImageTransformOptions = LongEdgeImageOptions | ExactImageOptions | CropImageOptions | AdjustImageOptions
+
+export interface VideoEncodeOptions {
+  mode: 'encode'
   codec: VideoCodec
   targetHeight: number
   audioBitrateKbps: number
@@ -40,6 +63,37 @@ export interface VideoTransformOptions {
   preset?: VideoPreset
   skipUpscale?: boolean
 }
+
+export interface VideoRemuxOptions {
+  mode: 'remux'
+}
+
+export interface VideoExtractMp3Options {
+  mode: 'extract_mp3'
+}
+
+export interface VideoSnapshotOptions {
+  mode: 'snapshot'
+  timestamp: number
+}
+
+export interface VideoTrimOptions {
+  mode: 'trim'
+  trimStart: number
+  trimEnd: number
+}
+
+export interface VideoMuteOptions {
+  mode: 'mute_video'
+}
+
+export type VideoTransformOptions =
+  | VideoEncodeOptions
+  | VideoRemuxOptions
+  | VideoExtractMp3Options
+  | VideoSnapshotOptions
+  | VideoTrimOptions
+  | VideoMuteOptions
 
 export interface TransformBatchOptions {
   image: ImageTransformOptions

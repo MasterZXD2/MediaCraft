@@ -1,10 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
+  AlertTriangle,
   Archive,
   Check,
   FileImage,
   Film,
   LoaderCircle,
+  Plus,
   RotateCcw,
   RotateCw,
   ScanSearch,
@@ -17,19 +19,31 @@ import {
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
+import { Input } from '@/components/ui/input'
 import { TransformModal } from '@/components/transform/TransformModal'
+import { ExportPanel } from '@/components/organize/ExportPanel'
+import { DebugTerminal } from '@/components/cleanup/DebugTerminal'
+import type { ValidationFlagReason } from '../../../../shared/media'
 import {
   bestMediaId,
   compareMediaQuality,
+  selectActiveMediaIds,
   useMediaStore,
   type MediaFileData
 } from '@/store/mediaStore'
 
 export function RightSidebar(): JSX.Element {
-  const [transformOpen, setTransformOpen] = useState(false)
+  const transformOpen = useMediaStore((state) => state.transformModalOpen)
+  const exportOpen = useMediaStore((state) => state.exportPanelOpen)
+  const setTransformOpen = useMediaStore((state) => state.setTransformModalOpen)
+  const setExportOpen = useMediaStore((state) => state.setExportPanelOpen)
   const activeFilter = useMediaStore((state) => state.activeFilter)
+  const activeMediaIds = useMediaStore(selectActiveMediaIds)
   const selectedIds = useMediaStore((state) => state.selectedIds)
-  const selectedIdList = useMemo(() => Array.from(selectedIds), [selectedIds])
+  const selectedIdList = useMemo(
+    () => activeMediaIds.filter((id) => selectedIds.has(id)),
+    [activeMediaIds, selectedIds]
+  )
   const singleId = selectedIdList.length === 1 ? selectedIdList[0] : null
   const file = useMediaStore((state) => singleId ? state.byId[singleId] : undefined)
   const selectionSummary = useMemo(() => {
@@ -78,6 +92,7 @@ export function RightSidebar(): JSX.Element {
                   selectedIds={selectedIdList}
                   selectedFile={file?.status === 'active' ? file : undefined}
                   onOpenTransform={() => setTransformOpen(true)}
+                  onOpenExport={() => setExportOpen(true)}
                 />
               </>
             )}
@@ -85,6 +100,7 @@ export function RightSidebar(): JSX.Element {
         </ScrollArea>
       </aside>
       <TransformModal open={transformOpen} onOpenChange={setTransformOpen} />
+      <ExportPanel open={exportOpen} onOpenChange={setExportOpen} selectedIds={selectedIdList} />
     </>
   )
 }
@@ -129,6 +145,7 @@ function DuplicateScanner(): JSX.Element {
         </div>
       )}
       {error && <p className="mt-2 text-[10px] text-destructive">{error}</p>}
+      <DebugTerminal />
     </section>
   )
 }
@@ -415,12 +432,35 @@ function SelectedMediaInspector({ file }: { file: MediaFileData }): JSX.Element 
         </div>
       </div>
 
+      {file.flagReason && (
+        <div className="mt-3 flex gap-3 rounded-md border border-amber-400/40 bg-amber-400/10 p-3 text-amber-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.12em]">
+              {flagReasonLabel(file.flagReason)}
+            </p>
+            <p className="mt-1 text-[10px] leading-relaxed text-amber-100/70">
+              {flagReasonDescription(file.flagReason)}
+            </p>
+          </div>
+        </div>
+      )}
+
       <dl className="mt-4 space-y-2.5">
         <MetadataRow label="Type" value={file.type === 'image' ? 'Image' : 'Video'} />
         <MetadataRow label="File size" value={formatBytes(file.size)} />
         <MetadataRow label="Resolution" value={formatResolution(file)} />
-        {file.type === 'video' && file.duration !== null && (
-          <MetadataRow label="Duration" value={formatDuration(file.duration)} />
+        {file.type === 'video' && (
+          <>
+            <MetadataRow
+              label="Duration"
+              value={file.duration !== null ? formatDuration(file.duration) : 'Unavailable'}
+            />
+            <MetadataRow
+              label="Frame rate"
+              value={file.fps !== null ? `${formatFps(file.fps)} FPS` : 'Unavailable'}
+            />
+          </>
         )}
         <div className="text-xs">
           <dt className="text-muted-foreground">Path</dt>
@@ -429,18 +469,138 @@ function SelectedMediaInspector({ file }: { file: MediaFileData }): JSX.Element 
           </dd>
         </div>
       </dl>
+      <TagEditor file={file} />
     </>
+  )
+}
+
+function TagEditor({ file }: { file: MediaFileData }): JSX.Element {
+  const [tagName, setTagName] = useState('')
+  const availableTags = useMediaStore((state) => state.availableTags)
+  const searchTags = useMediaStore((state) => state.searchTags)
+  const isTagging = useMediaStore((state) => state.isTagging)
+  const tagError = useMediaStore((state) => state.tagError)
+  const addTag = useMediaStore((state) => state.addTagToFile)
+  const removeTag = useMediaStore((state) => state.removeTagFromFile)
+  const toggleSearchTag = useMediaStore((state) => state.toggleSearchTag)
+  const loadAvailableTags = useMediaStore((state) => state.loadAvailableTags)
+  const suggestions = useMemo(() => availableTags.filter((candidate) =>
+    !file.tags.some((tag) => tag.localeCompare(candidate.name, undefined, { sensitivity: 'base' }) === 0)
+  ).slice(0, 6), [availableTags, file.tags])
+
+  useEffect(() => {
+    void loadAvailableTags()
+  }, [loadAvailableTags])
+
+  const submitTag = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    const nextTag = tagName.trim()
+    if (!nextTag) return
+    if (await addTag(file.id, nextTag)) setTagName('')
+  }
+
+  return (
+    <section className="mt-5 border-t border-border/70 pt-4">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Tags</p>
+        <span className="font-mono text-[9px] text-muted-foreground">{file.tags.length}</span>
+      </div>
+
+      {file.tags.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {file.tags.map((tag) => {
+            const isFiltering = searchTags.some(
+              (activeTag) => activeTag.localeCompare(tag, undefined, { sensitivity: 'base' }) === 0
+            )
+            return (
+              <span
+                key={tag}
+                className={`inline-flex h-7 max-w-full items-center overflow-hidden rounded-md border text-[10px] ${
+                  isFiltering
+                    ? 'border-primary/60 bg-primary/15 text-primary'
+                    : 'border-border bg-secondary/70 text-secondary-foreground'
+                }`}
+              >
+                <button
+                  type="button"
+                  className="min-w-0 truncate px-2 hover:text-foreground"
+                  onClick={() => toggleSearchTag(tag)}
+                  title={isFiltering ? `Stop filtering by ${tag}` : `Filter gallery by ${tag}`}
+                >
+                  {tag}
+                </button>
+                <button
+                  type="button"
+                  className="grid h-full w-7 shrink-0 place-items-center border-l border-current/10 hover:bg-destructive/20 hover:text-destructive"
+                  disabled={isTagging}
+                  onClick={() => void removeTag(file.id, tag)}
+                  title={`Remove ${tag}`}
+                  aria-label={`Remove tag ${tag}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )
+          })}
+        </div>
+      ) : (
+        <p className="mt-3 text-[10px] text-muted-foreground">No tags assigned.</p>
+      )}
+
+      <form className="mt-3 flex gap-2" onSubmit={(event) => void submitTag(event)}>
+        <Input
+          value={tagName}
+          onChange={(event) => setTagName(event.target.value)}
+          maxLength={48}
+          placeholder="Add a tag"
+          aria-label="Tag name"
+          className="h-8 min-w-0 text-xs"
+          disabled={isTagging}
+        />
+        <Button
+          type="submit"
+          variant="outline"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          disabled={isTagging || tagName.trim().length === 0}
+          title="Add tag"
+          aria-label="Add tag"
+        >
+          {isTagging ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+        </Button>
+      </form>
+
+      {suggestions.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {suggestions.map((tag) => (
+            <button
+              key={tag.id}
+              type="button"
+              className="max-w-full truncate rounded px-1.5 py-1 text-[9px] text-muted-foreground hover:bg-accent hover:text-foreground"
+              disabled={isTagging}
+              onClick={() => void addTag(file.id, tag.name)}
+              title={`Add ${tag.name}`}
+            >
+              + {tag.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {tagError && <p className="mt-2 text-[10px] text-destructive">{tagError}</p>}
+    </section>
   )
 }
 
 function NormalActions({
   selectedIds,
   selectedFile,
-  onOpenTransform
+  onOpenTransform,
+  onOpenExport
 }: {
   selectedIds: string[]
   selectedFile?: MediaFileData
   onOpenTransform: () => void
+  onOpenExport: () => void
 }): JSX.Element {
   const isTrashing = useMediaStore((state) => state.isTrashing)
   const isTransformStarting = useMediaStore((state) => state.isTransformStarting)
@@ -474,7 +634,19 @@ function NormalActions({
           {isTransforming ? 'Converting' : 'Convert'}
         </Button>
         <PlaceholderAction icon={RotateCw} label="Rotate" phase="Transform" />
-        <PlaceholderAction icon={Archive} label="Export" phase="Organize" />
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-16 flex-col gap-1.5 bg-background/40"
+          disabled={activeSelectionCount === 0}
+          onClick={onOpenExport}
+          title={activeSelectionCount > 0
+            ? `Rename and export ${activeSelectionCount} selected item${activeSelectionCount === 1 ? '' : 's'}`
+            : 'Select media to export'}
+        >
+          <Archive className="h-4 w-4 text-primary" />
+          Export
+        </Button>
         <PlaceholderAction icon={Sparkles} label="Enhance" phase="Transform" />
       </div>
       <Button
@@ -505,7 +677,7 @@ function PlaceholderAction({
 }: {
   icon: typeof Archive
   label: string
-  phase: 'Transform' | 'Organize'
+  phase: 'Transform'
 }): JSX.Element {
   return (
     <Button
@@ -552,6 +724,20 @@ function formatResolution(file: MediaFileData): string {
   return file.width && file.height ? `${file.width} x ${file.height}` : 'Unavailable'
 }
 
+function flagReasonLabel(reason: ValidationFlagReason): string {
+  if (reason === 'CORRUPT') return 'Corrupt media'
+  if (reason === 'TOO_SMALL') return 'Image too small'
+  if (reason === 'BAD_ASPECT') return 'Unusual aspect ratio'
+  return 'Invalid video metadata'
+}
+
+function flagReasonDescription(reason: ValidationFlagReason): string {
+  if (reason === 'CORRUPT') return 'The file is empty, unreadable, mismatched, or has no video stream.'
+  if (reason === 'TOO_SMALL') return 'The image width or height is below the 512 px validation threshold.'
+  if (reason === 'BAD_ASPECT') return 'The image aspect ratio falls outside the accepted 1:3 to 3:1 range.'
+  return 'FFprobe could not determine a positive duration or frame rate.'
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -568,4 +754,8 @@ function formatDuration(seconds: number): string {
   return hours > 0
     ? `${hours}:${minutes.toString().padStart(2, '0')}:${remainder.toString().padStart(2, '0')}`
     : `${minutes}:${remainder.toString().padStart(2, '0')}`
+}
+
+function formatFps(fps: number): string {
+  return Number.isInteger(fps) ? fps.toFixed(0) : fps.toFixed(2)
 }

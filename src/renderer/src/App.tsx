@@ -2,6 +2,7 @@ import { LeftSidebar } from '@/components/layout/LeftSidebar'
 import { MainArea } from '@/components/layout/MainArea'
 import { RightSidebar } from '@/components/layout/RightSidebar'
 import { TopBar } from '@/components/layout/TopBar'
+import { MediaViewer } from '@/components/curate/MediaViewer'
 
 export default function App(): JSX.Element {
   return (
@@ -12,6 +13,7 @@ export default function App(): JSX.Element {
         <MainArea />
         <RightSidebar />
       </div>
+      <MediaViewer />
     </div>
   )
 }

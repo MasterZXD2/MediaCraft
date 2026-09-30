@@ -15,6 +15,7 @@ interface HashTask {
   command: Extract<HashWorkerCommand, { type: 'hash' }>
   resolve: (hash: string) => void
   reject: (error: Error) => void
+  onDebug?: (message: string) => void
 }
 
 interface GroupTask {
@@ -23,6 +24,7 @@ interface GroupTask {
   command: Extract<HashWorkerCommand, { type: 'group' }>
   resolve: (groups: string[][]) => void
   reject: (error: Error) => void
+  onDebug?: (message: string) => void
 }
 
 type PoolTask = HashTask | GroupTask
@@ -46,7 +48,7 @@ export class HashWorkerPool {
     for (let index = 0; index < size; index++) this.slots.push(this.createSlot())
   }
 
-  hashFile(filePath: string, mediaType: MediaType): Promise<string> {
+  hashFile(filePath: string, mediaType: MediaType, onDebug?: (message: string) => void): Promise<string> {
     if (this.shuttingDown) return Promise.reject(new Error('Hash worker pool is shutting down.'))
 
     const jobId = randomUUID()
@@ -56,14 +58,15 @@ export class HashWorkerPool {
         jobId,
         command: { type: 'hash', jobId, filePath, mediaType },
         resolve: resolveTask,
-        reject: rejectTask
+        reject: rejectTask,
+        onDebug
       })
     })
     this.drain()
     return result
   }
 
-  groupHashes(items: HashedMediaItem[], threshold: number): Promise<string[][]> {
+  groupHashes(items: HashedMediaItem[], threshold: number, onDebug?: (message: string) => void): Promise<string[][]> {
     if (this.shuttingDown) return Promise.reject(new Error('Hash worker pool is shutting down.'))
 
     const jobId = randomUUID()
@@ -73,7 +76,8 @@ export class HashWorkerPool {
         jobId,
         command: { type: 'group', jobId, items, threshold },
         resolve: resolveTask,
-        reject: rejectTask
+        reject: rejectTask,
+        onDebug
       })
     })
     this.drain()
@@ -133,6 +137,10 @@ export class HashWorkerPool {
 
     const task = slot.task
     if (!task || task.jobId !== message.jobId) return
+    if (message.type === 'debug-log') {
+      task.onDebug?.(message.message)
+      return
+    }
     slot.task = null
 
     if (message.type === 'job-error') {

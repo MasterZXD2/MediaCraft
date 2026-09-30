@@ -4,18 +4,25 @@ import { extname, join, resolve } from 'node:path'
 import { closeDatabase, initializeDatabase } from '../db'
 import {
   commitScanGeneration,
+  addTagToFile,
   countFilesInFolder,
   countTrashInFolder,
   createScanGeneration,
   deleteTrashRecords,
+  deleteGlobalTag,
   getDuplicateCandidatesPage,
   getFilesInFolderPage,
+  getFolderTree,
   getMediaReferences,
+  getAllTags,
   getTrashInFolderPage,
   getTrashPathsPage,
   markAsTrash,
+  removeTagFromFile,
+  renameGlobalTag,
   restoreFromTrash,
   saveDuplicateGroups,
+  saveMediaMetadata,
   savePerceptualHashes,
   upsertMediaFiles,
   type MediaFileData
@@ -37,7 +44,12 @@ const DUPLICATE_PAGE_SIZE = 500
 const TRASH_PATH_PAGE_SIZE = 250
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp'])
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.webm'])
-const DEFAULT_CATALOG_QUERY: CatalogQueryOptions = { searchQuery: '', sortBy: 'date_desc' }
+const DEFAULT_CATALOG_QUERY: CatalogQueryOptions = {
+  searchQuery: '',
+  searchTags: [],
+  sortBy: 'date_desc',
+  activeFolderPath: null
+}
 
 interface CatalogWorkerData {
   databasePath: string
@@ -56,6 +68,8 @@ const data = workerData as CatalogWorkerData
 let activeRequestId: string | null = null
 let activeQueryRequestId: string | null = null
 let shuttingDown = false
+const pendingDuplicatePages = new Map<string, () => void>()
+const cancelledDuplicateRequests = new Set<string>()
 
 initializeDatabase(data.databasePath)
 postMessage({ type: 'ready' })
@@ -83,8 +97,31 @@ port.on('message', (message: CatalogWorkerCommand) => {
     return
   }
 
+  if (message.type === 'get-folder-tree') {
+    try {
+      postMessage({
+        type: 'folder-tree-complete',
+        requestId: message.requestId,
+        folderPaths: getFolderTree(resolve(message.datasetRoot))
+      })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
   if (message.type === 'get-duplicate-candidates') {
-    void streamDuplicateCandidates(message.requestId, resolve(message.folderPath))
+    void streamDuplicateCandidates(
+      message.requestId,
+      resolve(message.folderPath),
+      message.folderConstraint ? resolve(message.folderConstraint) : null
+    )
+    return
+  }
+
+  if (message.type === 'duplicate-candidates-next' || message.type === 'cancel-duplicate-candidates') {
+    if (message.type === 'cancel-duplicate-candidates') cancelledDuplicateRequests.add(message.requestId)
+    pendingDuplicatePages.get(message.requestId)?.()
     return
   }
 
@@ -100,7 +137,11 @@ port.on('message', (message: CatalogWorkerCommand) => {
 
   if (message.type === 'save-duplicate-groups') {
     try {
-      saveDuplicateGroups(resolve(message.folderPath), message.assignments)
+      saveDuplicateGroups(
+        resolve(message.folderPath),
+        message.assignments,
+        message.folderConstraint ? resolve(message.folderConstraint) : null
+      )
       postMessage({ type: 'duplicate-write-complete', requestId: message.requestId })
     } catch (error) {
       postDuplicateError(message.requestId, error)
@@ -153,8 +194,64 @@ port.on('message', (message: CatalogWorkerCommand) => {
     return
   }
 
+  if (message.type === 'save-media-metadata') {
+    try {
+      saveMediaMetadata(message.updates.map((update) => ({
+        ...update,
+        filePath: resolve(update.filePath)
+      })))
+      postMessage({ type: 'media-metadata-write-complete', requestId: message.requestId })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
+  if (message.type === 'add-tag' || message.type === 'remove-tag') {
+    try {
+      const filePath = resolve(message.filePath)
+      const result = message.type === 'add-tag'
+        ? addTagToFile(filePath, message.tagName)
+        : removeTagFromFile(filePath, message.tagName)
+      postMessage({ type: 'tag-write-complete', requestId: message.requestId, result })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
+  if (message.type === 'get-all-tags') {
+    try {
+      postMessage({ type: 'all-tags-complete', requestId: message.requestId, tags: getAllTags() })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
+  if (message.type === 'delete-global-tag') {
+    try {
+      const deleted = deleteGlobalTag(message.tagId)
+      postMessage({ type: 'tag-delete-complete', requestId: message.requestId, deleted })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
+  if (message.type === 'rename-global-tag') {
+    try {
+      const tag = renameGlobalTag(message.tagId, message.newName)
+      postMessage({ type: 'tag-rename-complete', requestId: message.requestId, tag })
+    } catch (error) {
+      postDuplicateError(message.requestId, error)
+    }
+    return
+  }
+
   if (message.type === 'shutdown') {
     shuttingDown = true
+    for (const resume of pendingDuplicatePages.values()) resume()
     activeRequestId = null
     activeQueryRequestId = null
     closeDatabase()
@@ -163,27 +260,40 @@ port.on('message', (message: CatalogWorkerCommand) => {
   }
 })
 
-async function streamDuplicateCandidates(requestId: string, folderPath: string): Promise<void> {
+async function streamDuplicateCandidates(
+  requestId: string,
+  folderPath: string,
+  folderConstraint: string | null
+): Promise<void> {
   let afterPath = ''
   let total = 0
 
   try {
-    while (!shuttingDown) {
-      const candidates = getDuplicateCandidatesPage(folderPath, afterPath, DUPLICATE_PAGE_SIZE)
+    while (!shuttingDown && !cancelledDuplicateRequests.has(requestId)) {
+      const candidates = getDuplicateCandidatesPage(
+        folderPath,
+        afterPath,
+        DUPLICATE_PAGE_SIZE,
+        folderConstraint
+      )
       if (candidates.length === 0) break
 
       total += candidates.length
       afterPath = candidates[candidates.length - 1].filePath
       postMessage({ type: 'duplicate-candidates-chunk', requestId, candidates })
+      await new Promise<void>((resume) => pendingDuplicatePages.set(requestId, resume))
+      pendingDuplicatePages.delete(requestId)
       if (candidates.length < DUPLICATE_PAGE_SIZE) break
-      await yieldToMessageLoop()
     }
 
-    if (!shuttingDown) {
+    if (!shuttingDown && !cancelledDuplicateRequests.has(requestId)) {
       postMessage({ type: 'duplicate-candidates-complete', requestId, total })
     }
   } catch (error) {
     if (!shuttingDown) postDuplicateError(requestId, error)
+  } finally {
+    pendingDuplicatePages.delete(requestId)
+    cancelledDuplicateRequests.delete(requestId)
   }
 }
 
@@ -261,7 +371,7 @@ async function runCatalogQuery(
       requestId,
       folderPath,
       operation: 'query',
-      total: countFilesInFolder(folderPath, query.searchQuery)
+       total: countFilesInFolder(folderPath, query.searchQuery, query.searchTags, query.activeFolderPath)
     })
     activeQueryRequestId = null
   } catch (error) {
@@ -283,16 +393,18 @@ async function streamTrashedFiles(
   query: CatalogQueryOptions,
   operation: CatalogOperation
 ): Promise<void> {
-  const total = countTrashInFolder(folderPath, query.searchQuery)
+  const total = countTrashInFolder(folderPath, query.searchQuery, query.searchTags, query.activeFolderPath)
 
   for (let offset = 0; offset < total; offset += CACHE_PAGE_SIZE) {
     if (!isOperationActive(requestId, operation)) return
     const files = getTrashInFolderPage(
       folderPath,
       query.searchQuery,
+      query.searchTags,
       query.sortBy,
       CACHE_PAGE_SIZE,
-      offset
+      offset,
+      query.activeFolderPath
     ).map(toMediaFile)
     if (files.length > 0) {
       postEvent({ type: 'trash-chunk', requestId, folderPath, operation, files })
@@ -307,16 +419,18 @@ async function streamCachedFiles(
   query: CatalogQueryOptions,
   operation: CatalogOperation
 ): Promise<void> {
-  const total = countFilesInFolder(folderPath, query.searchQuery)
+  const total = countFilesInFolder(folderPath, query.searchQuery, query.searchTags, query.activeFolderPath)
 
   for (let offset = 0; offset < total; offset += CACHE_PAGE_SIZE) {
     if (!isOperationActive(requestId, operation)) return
     const files = getFilesInFolderPage(
       folderPath,
       query.searchQuery,
+      query.searchTags,
       query.sortBy,
       CACHE_PAGE_SIZE,
-      offset
+      offset,
+      query.activeFolderPath
     )
       .filter((file) => !isIgnoredFilesystemArtifactPath(folderPath, file.filePath))
       .map(toMediaFile)
@@ -363,7 +477,7 @@ async function synchronizeDirectory(requestId: string, folderPath: string): Prom
       candidates.push({ filePath: entryPath, filename: entry.name, type })
     }
 
-    await statCandidatesBounded(candidates, requestId, folderPath, async (file) => {
+    await statCandidatesBounded(candidates, requestId, currentDirectory, async (file) => {
       chunk.push(file)
       if (chunk.length < SCAN_CHUNK_SIZE) return
 
@@ -398,7 +512,7 @@ async function synchronizeDirectory(requestId: string, folderPath: string): Prom
 async function statCandidatesBounded(
   candidates: MediaCandidate[],
   requestId: string,
-  folderPath: string,
+  mediaFolderPath: string,
   onFile: (file: MediaFileData) => Promise<void>
 ): Promise<void> {
   let nextIndex = 0
@@ -422,7 +536,7 @@ async function statCandidatesBounded(
       if (!fileStats.isFile()) continue
 
       await onFile({
-        folderPath,
+         folderPath: mediaFolderPath,
         filePath: candidate.filePath,
         filename: candidate.filename,
         type: candidate.type,
@@ -484,6 +598,7 @@ function toMediaFile(file: MediaFileData): MediaFile {
   const normalizedPath = file.filePath.replaceAll('\\', '/')
   return {
     path: file.filePath,
+    folderPath: file.folderPath,
     filename: file.filename,
     size: file.sizeBytes,
     type: file.type,
@@ -495,6 +610,8 @@ function toMediaFile(file: MediaFileData): MediaFile {
     ...(file.duplicateGroupId !== undefined
       ? { duplicateGroupId: file.duplicateGroupId }
       : {}),
+    ...(file.flagReason !== undefined ? { flagReason: file.flagReason } : {}),
+    tags: file.tags ?? [],
     previewUrl: `mediacraft-media://local/${encodeURIComponent(normalizedPath)}`
   }
 }

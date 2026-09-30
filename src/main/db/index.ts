@@ -31,6 +31,7 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
       scan_generation INTEGER NOT NULL DEFAULT 0,
       perceptual_hash TEXT,
       duplicate_group_id TEXT,
+      flag_reason TEXT,
       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'trash'))
     );
   `)
@@ -51,8 +52,23 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
   if (!mediaFileColumns.some((column) => column.name === 'status')) {
     database.exec("ALTER TABLE media_files ADD COLUMN status TEXT NOT NULL DEFAULT 'active';")
   }
+  if (!mediaFileColumns.some((column) => column.name === 'flag_reason')) {
+    database.exec('ALTER TABLE media_files ADD COLUMN flag_reason TEXT;')
+  }
 
   database.exec(`
+    CREATE TABLE IF NOT EXISTS tags (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL COLLATE NOCASE UNIQUE
+        CHECK (length(trim(name)) BETWEEN 1 AND 48)
+    );
+
+    CREATE TABLE IF NOT EXISTS file_tags (
+      file_id INTEGER NOT NULL REFERENCES media_files(id) ON DELETE CASCADE,
+      tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+      PRIMARY KEY (file_id, tag_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_media_files_folder_path
       ON media_files (folder_path);
 
@@ -71,6 +87,9 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
     CREATE INDEX IF NOT EXISTS idx_media_files_folder_status
       ON media_files (folder_path, status);
 
+    CREATE INDEX IF NOT EXISTS idx_media_files_folder_flags
+      ON media_files (folder_path, status, flag_reason);
+
     CREATE INDEX IF NOT EXISTS idx_media_files_catalog_date
       ON media_files (folder_path, status, last_modified, file_path);
 
@@ -79,6 +98,9 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
 
     CREATE INDEX IF NOT EXISTS idx_media_files_catalog_size
       ON media_files (folder_path, status, size_bytes, file_path);
+
+    CREATE INDEX IF NOT EXISTS idx_file_tags_tag_file
+      ON file_tags (tag_id, file_id);
   `)
 
   return database

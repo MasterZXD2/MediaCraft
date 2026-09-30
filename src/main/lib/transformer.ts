@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { link, mkdir, rm } from 'node:fs/promises'
+import { link, mkdir, readFile, rm } from 'node:fs/promises'
 import { dirname, extname, resolve } from 'node:path'
 import sharp, { type Sharp } from 'sharp'
 import { probeVideo, runFfmpeg } from './ffmpeg'
@@ -12,6 +12,10 @@ import type {
 export interface TransformResult {
   outputPath: string | null
   skipped: boolean
+}
+
+export interface ThumbnailExtractionResult {
+  thumbnails: string[]
 }
 
 export interface VideoEncodingProgress {
@@ -47,12 +51,29 @@ export async function transformImage(
       withoutEnlargement: options.skipUpscale ?? true,
       kernel: sharp.kernel.lanczos3
     })
-  } else {
+  } else if (options.mode === 'exact') {
     pipeline = pipeline.resize(options.width, options.height, {
       fit: 'cover',
       position: 'centre',
       kernel: sharp.kernel.lanczos3
     })
+  } else if (options.mode === 'crop') {
+    pipeline = pipeline.extract({
+      left: Math.round(Math.max(0, options.cropRect.x)),
+      top: Math.round(Math.max(0, options.cropRect.y)),
+      width: Math.round(Math.max(1, options.cropRect.width)),
+      height: Math.round(Math.max(1, options.cropRect.height))
+    })
+  } else if (options.mode === 'adjust_image') {
+    if (options.rotate) {
+      pipeline = pipeline.rotate(options.rotate)
+    }
+    if (options.flipHorizontal) {
+      pipeline = pipeline.flop()
+    }
+    if (options.flipVertical) {
+      pipeline = pipeline.flip()
+    }
   }
 
   pipeline = configureImageEncoder(
@@ -79,6 +100,70 @@ export async function transformImage(
   }
 }
 
+export async function extractVideoThumbnails(
+  sourcePath: string,
+  count: number,
+  execution: TransformExecutionOptions = {}
+): Promise<ThumbnailExtractionResult> {
+  throwIfAborted(execution.signal)
+  const absoluteSourcePath = resolve(sourcePath)
+  const metadata = await probeVideo(absoluteSourcePath, {
+    signal: execution.signal,
+    timeoutMs: 30_000
+  })
+
+  if (!metadata.duration || metadata.duration <= 0) {
+    throw new Error('Cannot extract thumbnails from a video with unknown duration.')
+  }
+
+  const thumbnailCount = Math.max(1, Math.min(count, 20))
+  const interval = metadata.duration / (thumbnailCount + 1)
+  const thumbnails: string[] = []
+  const tempDir = resolve(dirname(absoluteSourcePath), `.thumbnails-${randomUUID()}`)
+
+  try {
+    await mkdir(tempDir, { recursive: true })
+
+    for (let i = 0; i < thumbnailCount; i++) {
+      const timestamp = interval * (i + 1)
+      const tempPath = resolve(tempDir, `thumb_${i}.jpg`)
+
+      const ffmpegArgs = [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-ss',
+        String(timestamp),
+        '-i',
+        absoluteSourcePath,
+        '-frames:v',
+        '1',
+        '-vf',
+        'scale=160:-1',
+        '-q:v',
+        '5',
+        '-f',
+        'image2',
+        tempPath
+      ]
+
+      await runFfmpeg(ffmpegArgs, {
+        signal: execution.signal,
+        timeoutMs: 10_000
+      })
+
+      const imageBuffer = await readFile(tempPath)
+      const base64 = imageBuffer.toString('base64')
+      thumbnails.push(`data:image/jpeg;base64,${base64}`)
+    }
+
+    return { thumbnails }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
 export async function transformVideo(
   sourcePath: string,
   outputPath: string,
@@ -93,57 +178,147 @@ export async function transformVideo(
     timeoutMs: 30_000
   })
 
-  if (options.skipUpscale && metadata.height !== null && metadata.height <= options.targetHeight) {
+  if (
+    options.mode === 'encode'
+    && options.skipUpscale
+    && metadata.height !== null
+    && metadata.height <= options.targetHeight
+  ) {
     execution.onProgress?.({ progress: 100 })
     return { outputPath: null, skipped: true }
   }
 
   await mkdir(dirname(absoluteOutputPath), { recursive: true })
-  const temporaryPath = createTemporaryPath(absoluteOutputPath, '.mp4')
+  const temporaryPath = createTemporaryPath(absoluteOutputPath)
   const parser = new FfmpegProgressParser(metadata.duration, execution.onProgress)
+  const ffmpegArgs = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-y',
+    ...(options.mode === 'snapshot'
+      ? [
+          '-ss',
+          String(options.timestamp),
+          '-i',
+          absoluteSourcePath,
+          '-frames:v',
+          '1',
+          '-q:v',
+          '2',
+          '-progress',
+          'pipe:2',
+          '-nostats',
+          '-f',
+          'image2'
+        ]
+      : options.mode === 'trim'
+        ? [
+            '-ss',
+            String(options.trimStart),
+            '-to',
+            String(options.trimEnd),
+            '-i',
+            absoluteSourcePath,
+            '-map',
+            '0',
+            '-c',
+            'copy',
+            '-progress',
+            'pipe:2',
+            '-nostats'
+          ]
+        : options.mode === 'remux'
+          ? [
+              '-i',
+              absoluteSourcePath,
+              '-map',
+              '0:v?',
+              '-map',
+              '0:a?',
+              '-sn',
+              '-c',
+              'copy',
+              '-movflags',
+              '+faststart',
+              '-progress',
+              'pipe:2',
+              '-nostats',
+              '-f',
+              'mp4'
+            ]
+          : options.mode === 'mute_video'
+            ? [
+                '-i',
+                absoluteSourcePath,
+                '-map',
+                '0:v',
+                '-c:v',
+                'copy',
+                '-an',
+                '-movflags',
+                '+faststart',
+                '-progress',
+                'pipe:2',
+                '-nostats',
+                '-f',
+                'mp4'
+              ]
+          : options.mode === 'extract_mp3'
+            ? [
+                '-i',
+                absoluteSourcePath,
+                '-map',
+                '0:a:0?',
+                '-vn',
+                '-c:a',
+                'libmp3lame',
+                '-q:a',
+                '2',
+                '-progress',
+                'pipe:2',
+                '-nostats',
+                '-f',
+                'mp3'
+              ]
+            : [
+                '-i',
+                absoluteSourcePath,
+                '-map',
+                '0:v:0',
+                '-map',
+                '0:a?',
+                '-vf',
+                'scale=-2:' + options.targetHeight,
+                '-c:v',
+                options.codec,
+                '-preset',
+                options.preset ?? 'medium',
+                '-crf',
+                String(options.crf ?? (options.codec === 'libx264' ? 23 : 28)),
+                '-pix_fmt',
+                'yuv420p',
+                '-c:a',
+                'aac',
+                '-b:a',
+                String(options.audioBitrateKbps) + 'k',
+                '-movflags',
+                '+faststart',
+                '-progress',
+                'pipe:2',
+                '-nostats',
+                '-f',
+                'mp4'
+              ]),
+    temporaryPath
+  ]
 
   try {
-    await runFfmpeg(
-      [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        '-i',
-        absoluteSourcePath,
-        '-map',
-        '0:v:0',
-        '-map',
-        '0:a?',
-        '-vf',
-        `scale=-2:${options.targetHeight}`,
-        '-c:v',
-        options.codec,
-        '-preset',
-        options.preset ?? 'medium',
-        '-crf',
-        String(options.crf ?? (options.codec === 'libx264' ? 23 : 28)),
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-b:a',
-        `${options.audioBitrateKbps}k`,
-        '-movflags',
-        '+faststart',
-        '-progress',
-        'pipe:2',
-        '-nostats',
-        '-f',
-        'mp4',
-        temporaryPath
-      ],
-      {
-        signal: execution.signal,
-        timeoutMs: null,
-        onStderr: (chunk) => parser.push(chunk)
-      }
-    )
+    await runFfmpeg(ffmpegArgs, {
+      signal: execution.signal,
+      timeoutMs: null,
+      onStderr: (chunk) => parser.push(chunk)
+    })
     parser.finish()
     throwIfAborted(execution.signal)
     await publishAtomically(temporaryPath, absoluteOutputPath)
@@ -157,6 +332,14 @@ export async function transformVideo(
 export function outputExtensionForImage(sourcePath: string, format: ImageOutputFormat): string {
   const resolvedFormat = resolveImageFormat(sourcePath, format)
   return resolvedFormat === 'jpeg' ? '.jpg' : `.${resolvedFormat}`
+}
+
+export function outputExtensionForVideo(sourcePath: string, options: VideoTransformOptions): string {
+  if (options.mode === 'extract_mp3') return '.mp3'
+  if (options.mode === 'snapshot') return '.jpg'
+  if (options.mode === 'trim') return extname(sourcePath) || '.mp4'
+  if (options.mode === 'mute_video') return '.mp4'
+  return '.mp4'
 }
 
 function configureImageEncoder(

@@ -140,6 +140,7 @@ const filterLabels = {
   all: 'All Media',
   images: 'Images',
   videos: 'Videos',
+  flagged: 'Flagged',
   duplicates: 'Duplicates',
   trash: 'Trash'
 } as const

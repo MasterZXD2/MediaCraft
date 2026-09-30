@@ -1,4 +1,4 @@
-import type { MediaType } from '../../shared/media'
+import type { MediaMetadataUpdate, MediaType, ValidationFlagReason } from '../../shared/media'
 import type {
   DuplicateCandidate,
   DuplicateGroupAssignment,
@@ -8,6 +8,7 @@ import { getDatabase } from './index'
 import type { MoveToTrashResult } from '../../shared/cleanup'
 import type { CatalogMediaReference } from '../../shared/transform'
 import type { CatalogSortBy } from '../../shared/catalog'
+import type { TagMutationResult, TagRecord } from '../../shared/tags'
 
 export interface MediaFileData {
   id?: number
@@ -22,6 +23,8 @@ export interface MediaFileData {
   fps: number | null
   lastModified: number
   duplicateGroupId?: string | null
+  flagReason?: ValidationFlagReason | null
+  tags?: string[]
 }
 
 interface MediaFileRow {
@@ -37,6 +40,8 @@ interface MediaFileRow {
   fps: number | null
   last_modified: number
   duplicate_group_id: string | null
+  flag_reason: ValidationFlagReason | null
+  tags_json: string
 }
 
 type CatalogStatus = 'active' | 'trash'
@@ -48,6 +53,43 @@ const CATALOG_ORDER_BY: Record<CatalogSortBy, string> = {
   size_desc: 'size_bytes DESC, file_path COLLATE NOCASE ASC'
 }
 
+const MEDIA_TAGS_SELECT = `
+  COALESCE((
+    SELECT json_group_array(tagged.name)
+    FROM (
+      SELECT tags.name
+      FROM file_tags
+      JOIN tags ON tags.id = file_tags.tag_id
+      WHERE file_tags.file_id = media_files.id
+      ORDER BY tags.name COLLATE NOCASE
+    ) AS tagged
+  ), '[]') AS tags_json
+`
+
+const CATALOG_TAG_FILTER = `
+  AND (
+    @search_tag_count = 0
+    OR NOT EXISTS (
+      SELECT 1
+      FROM json_each(@search_tags_json) AS selected_tag
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM file_tags
+        JOIN tags ON tags.id = file_tags.tag_id
+        WHERE file_tags.file_id = media_files.id
+          AND tags.name = selected_tag.value COLLATE NOCASE
+      )
+    )
+  )
+`
+
+const CATALOG_FOLDER_FILTER = `
+  AND (
+    folder_path = @scope_folder_path
+    OR folder_path LIKE @scope_folder_prefix ESCAPE '!'
+  )
+`
+
 function prepareCatalogPages(
   db: ReturnType<typeof getDatabase>,
   status: CatalogStatus
@@ -57,11 +99,13 @@ function prepareCatalogPages(
       sortBy,
       db.prepare(`
         SELECT id, folder_path, file_path, filename, type, size_bytes,
-               width, height, duration, fps, last_modified, duplicate_group_id
+               width, height, duration, fps, last_modified, duplicate_group_id, flag_reason,
+               ${MEDIA_TAGS_SELECT}
         FROM media_files
-        WHERE folder_path = @folder_path
-          AND status = '${status}'
+         WHERE status = '${status}'
+           ${CATALOG_FOLDER_FILTER}
           AND filename LIKE @search_pattern ESCAPE '!'
+          ${CATALOG_TAG_FILTER}
         ORDER BY ${orderBy}
         LIMIT @limit OFFSET @offset
       `)
@@ -75,10 +119,10 @@ function prepareStatements() {
   const upsert = db.prepare(`
     INSERT INTO media_files (
       folder_path, file_path, filename, type, size_bytes,
-      width, height, duration, fps, last_modified, scan_generation
+      width, height, duration, fps, last_modified, scan_generation, flag_reason
     ) VALUES (
       @folder_path, @file_path, @filename, @type, @size_bytes,
-      @width, @height, @duration, @fps, @last_modified, @scan_generation
+      @width, @height, @duration, @fps, @last_modified, @scan_generation, @flag_reason
     )
     ON CONFLICT(file_path) DO UPDATE SET
       folder_path = excluded.folder_path,
@@ -124,11 +168,18 @@ function prepareStatements() {
           AND media_files.size_bytes = excluded.size_bytes
           THEN media_files.status
         ELSE 'active'
+      END,
+      flag_reason = CASE
+        WHEN media_files.last_modified = excluded.last_modified
+          AND media_files.size_bytes = excluded.size_bytes
+          THEN COALESCE(excluded.flag_reason, media_files.flag_reason)
+        ELSE excluded.flag_reason
       END
   `)
   const getByFolder = db.prepare(`
     SELECT id, folder_path, file_path, filename, type, size_bytes,
-           width, height, duration, fps, last_modified, duplicate_group_id
+           width, height, duration, fps, last_modified, duplicate_group_id, flag_reason,
+           ${MEDIA_TAGS_SELECT}
     FROM media_files
     WHERE folder_path = ? AND status = 'active'
     ORDER BY file_path COLLATE NOCASE
@@ -141,9 +192,10 @@ function prepareStatements() {
   const countCatalogPage = db.prepare(`
     SELECT COUNT(*) AS count
     FROM media_files
-    WHERE folder_path = @folder_path
-      AND status = @status
+    WHERE status = @status
       AND filename LIKE @search_pattern ESCAPE '!'
+      ${CATALOG_FOLDER_FILTER}
+      ${CATALOG_TAG_FILTER}
   `)
   const catalogPages = {
     active: prepareCatalogPages(db, 'active'),
@@ -151,7 +203,8 @@ function prepareStatements() {
   }
   const getActiveByPath = db.prepare(`
     SELECT id, folder_path, file_path, filename, type, size_bytes,
-           width, height, duration, fps, last_modified, duplicate_group_id
+           width, height, duration, fps, last_modified, duplicate_group_id, flag_reason,
+           ${MEDIA_TAGS_SELECT}
     FROM media_files
     WHERE file_path = ? AND status = 'active'
   `)
@@ -181,25 +234,54 @@ function prepareStatements() {
   const selectOlderGeneration = db.prepare(`
     SELECT file_path
     FROM media_files
-    WHERE folder_path = ? AND scan_generation < ?
+    WHERE (
+      folder_path = ?
+      OR folder_path LIKE ? ESCAPE '!'
+    ) AND scan_generation < ?
     ORDER BY file_path COLLATE NOCASE
   `)
   const deleteOlderGeneration = db.prepare(`
     DELETE FROM media_files
-    WHERE folder_path = ? AND scan_generation < ?
+    WHERE (
+      folder_path = ?
+      OR folder_path LIKE ? ESCAPE '!'
+    ) AND scan_generation < ?
+  `)
+  const getFolderTree = db.prepare(`
+    SELECT DISTINCT folder_path
+    FROM media_files
+    WHERE folder_path = @dataset_root
+       OR folder_path LIKE @dataset_prefix ESCAPE '!'
+    ORDER BY folder_path COLLATE NOCASE
   `)
   const getDuplicateCandidatesPage = db.prepare(`
     SELECT media.file_path, media.type, media.size_bytes, media.width, media.height,
            media.duration, media.last_modified, media.perceptual_hash
     FROM media_files AS media
-    WHERE media.folder_path = @folder_path
-      AND media.status = 'active'
+    WHERE media.status = 'active'
+      AND (
+        media.folder_path = @folder_path
+        OR media.folder_path LIKE @folder_prefix ESCAPE '!'
+      )
+      AND (
+        @folder_constraint IS NULL
+        OR media.folder_path = @folder_constraint
+        OR media.folder_path LIKE @folder_constraint_prefix ESCAPE '!'
+      )
       AND media.file_path > @after_path
       AND EXISTS (
         SELECT 1
         FROM media_files AS other
-        WHERE other.folder_path = media.folder_path
-          AND other.status = 'active'
+        WHERE other.status = 'active'
+          AND (
+            other.folder_path = @folder_path
+            OR other.folder_path LIKE @folder_prefix ESCAPE '!'
+          )
+          AND (
+            @folder_constraint IS NULL
+            OR other.folder_path = @folder_constraint
+            OR other.folder_path LIKE @folder_constraint_prefix ESCAPE '!'
+          )
           AND other.type = media.type
           AND other.file_path <> media.file_path
           AND (
@@ -230,10 +312,25 @@ function prepareStatements() {
       AND last_modified = @expected_last_modified
       AND status = 'active'
   `)
+  const updateMediaMetadata = db.prepare(`
+    UPDATE media_files
+    SET width = @width,
+        height = @height,
+        duration = @duration,
+        fps = @fps,
+        flag_reason = @flag_reason
+    WHERE file_path = @file_path
+      AND last_modified = @expected_last_modified
+      AND status = 'active'
+  `)
   const clearDuplicateGroups = db.prepare(`
     UPDATE media_files
     SET duplicate_group_id = NULL
-    WHERE folder_path = ? AND status = 'active'
+    WHERE status = 'active'
+      AND (
+        folder_path = @scope_folder_path
+        OR folder_path LIKE @scope_folder_prefix ESCAPE '!'
+      )
   `)
   const updateDuplicateGroup = db.prepare(`
     UPDATE media_files
@@ -272,6 +369,53 @@ function prepareStatements() {
     DELETE FROM media_files
     WHERE file_path = ? AND status = 'trash'
   `)
+  const getFileId = db.prepare(`
+    SELECT id
+    FROM media_files
+    WHERE file_path = ?
+  `)
+  const insertTag = db.prepare(`
+    INSERT INTO tags (name)
+    VALUES (?)
+    ON CONFLICT(name) DO NOTHING
+  `)
+  const getTagId = db.prepare(`
+    SELECT id
+    FROM tags
+    WHERE name = ? COLLATE NOCASE
+  `)
+  const attachTag = db.prepare(`
+    INSERT INTO file_tags (file_id, tag_id)
+    VALUES (?, ?)
+    ON CONFLICT(file_id, tag_id) DO NOTHING
+  `)
+  const detachTag = db.prepare(`
+    DELETE FROM file_tags
+    WHERE file_id = ? AND tag_id = ?
+  `)
+  const getFileTags = db.prepare(`
+    SELECT tags.name
+    FROM media_files
+    JOIN file_tags ON file_tags.file_id = media_files.id
+    JOIN tags ON tags.id = file_tags.tag_id
+    WHERE media_files.file_path = ?
+    ORDER BY tags.name COLLATE NOCASE
+  `)
+  const getAllTags = db.prepare(`
+    SELECT id, name
+    FROM tags
+    ORDER BY name COLLATE NOCASE
+  `)
+  const deleteGlobalTagStatement = db.prepare(`
+    DELETE FROM tags
+    WHERE id = ?
+  `)
+  const renameGlobalTagStatement = db.prepare(`
+    UPDATE tags
+    SET name = ?
+    WHERE id = ?
+    RETURNING id, name
+  `)
 
   const upsertMany = db.transaction((files: MediaFileData[], activeGeneration: number) => {
     const activeRows: MediaFileRow[] = []
@@ -283,11 +427,12 @@ function prepareStatements() {
     return activeRows.map(fromRow)
   })
   const commitGeneration = db.transaction((folderPath: string, activeGeneration: number) => {
-    const removed = selectOlderGeneration.all(folderPath, activeGeneration) as Array<{
+    const folderPrefix = toLikePrefix(folderPath)
+    const removed = selectOlderGeneration.all(folderPath, folderPrefix, activeGeneration) as Array<{
       file_path: string
       folder_path: string
     }>
-    deleteOlderGeneration.run(folderPath, activeGeneration)
+    deleteOlderGeneration.run(folderPath, folderPrefix, activeGeneration)
     return removed.map((row) => row.file_path)
   })
   const saveHashes = db.transaction((updates: PerceptualHashUpdate[]) => {
@@ -299,8 +444,25 @@ function prepareStatements() {
       })
     }
   })
-  const saveGroups = db.transaction((folderPath: string, assignments: DuplicateGroupAssignment[]) => {
-    clearDuplicateGroups.run(folderPath)
+  const saveMetadata = db.transaction((updates: MediaMetadataUpdate[]) => {
+    for (const update of updates) {
+      updateMediaMetadata.run({
+        file_path: update.filePath,
+        expected_last_modified: update.expectedLastModified,
+        width: update.width,
+        height: update.height,
+        duration: update.duration,
+        fps: update.fps,
+        flag_reason: update.flagReason
+      })
+    }
+  })
+  const saveGroups = db.transaction((folderPath: string, assignments: DuplicateGroupAssignment[], folderConstraint: string | null) => {
+    const scopeFolderPath = folderConstraint ?? folderPath
+    clearDuplicateGroups.run({
+      scope_folder_path: scopeFolderPath,
+      scope_folder_prefix: toLikePrefix(scopeFolderPath)
+    })
     for (const assignment of assignments) {
       updateDuplicateGroup.run({
         file_path: assignment.filePath,
@@ -325,6 +487,22 @@ function prepareStatements() {
     for (const filePath of filePaths) deletedCount += deleteTrashRecord.run(filePath).changes
     return deletedCount
   })
+  const addFileTag = db.transaction((filePath: string, tagName: string): TagMutationResult => {
+    const file = getFileId.get(filePath) as { id: number } | undefined
+    if (!file) throw new Error('The media file does not exist in the catalog.')
+    insertTag.run(tagName)
+    const tag = getTagId.get(tagName) as { id: number } | undefined
+    if (!tag) throw new Error('Unable to create the tag.')
+    attachTag.run(file.id, tag.id)
+    return { fileId: filePath, tags: readTagNames(getFileTags.all(filePath)) }
+  })
+  const removeFileTag = db.transaction((filePath: string, tagName: string): TagMutationResult => {
+    const file = getFileId.get(filePath) as { id: number } | undefined
+    if (!file) throw new Error('The media file does not exist in the catalog.')
+    const tag = getTagId.get(tagName) as { id: number } | undefined
+    if (tag) detachTag.run(file.id, tag.id)
+    return { fileId: filePath, tags: readTagNames(getFileTags.all(filePath)) }
+  })
 
   return {
     upsert,
@@ -337,13 +515,20 @@ function prepareStatements() {
     upsertMany,
     commitGeneration,
     saveHashes,
+    saveMetadata,
     saveGroups,
     trashFile,
     countTrashByFolder,
     getTrashPathsPage,
     restoreTrash,
     deleteTrashRecords,
-    getActiveReference
+    getActiveReference,
+    getFolderTree,
+    addFileTag,
+    removeFileTag,
+    getAllTags,
+    deleteGlobalTagStatement,
+    renameGlobalTagStatement
   }
 }
 
@@ -375,11 +560,28 @@ export function getFilesInFolder(folderPath: string): MediaFileData[] {
   return rows.map(fromRow)
 }
 
-export function countFilesInFolder(folderPath: string, searchQuery = ''): number {
+export function getFolderTree(datasetRoot: string): string[] {
+  const rows = getStatements().getFolderTree.all({
+    dataset_root: datasetRoot,
+    dataset_prefix: toLikePrefix(datasetRoot)
+  }) as Array<{ folder_path: string }>
+  return rows.map((row) => row.folder_path)
+}
+
+export function countFilesInFolder(
+  folderPath: string,
+  searchQuery = '',
+  searchTags: readonly string[] = [],
+  activeFolderPath: string | null = null
+): number {
+  const scopeFolderPath = activeFolderPath ?? folderPath
   const row = getStatements().countCatalogPage.get({
-    folder_path: folderPath,
+    scope_folder_path: scopeFolderPath,
+    scope_folder_prefix: toLikePrefix(scopeFolderPath),
     status: 'active',
-    search_pattern: toLikePattern(searchQuery)
+    search_pattern: toLikePattern(searchQuery),
+    search_tag_count: searchTags.length,
+    search_tags_json: JSON.stringify(searchTags)
   }) as { count: number }
   return row.count
 }
@@ -387,13 +589,19 @@ export function countFilesInFolder(folderPath: string, searchQuery = ''): number
 export function getFilesInFolderPage(
   folderPath: string,
   searchQuery: string,
+  searchTags: readonly string[],
   sortBy: CatalogSortBy,
   limit: number,
-  offset: number
+  offset: number,
+  activeFolderPath: string | null = null
 ): MediaFileData[] {
+  const scopeFolderPath = activeFolderPath ?? folderPath
   const rows = getStatements().catalogPages.active[sortBy].all({
-    folder_path: folderPath,
+    scope_folder_path: scopeFolderPath,
+    scope_folder_prefix: toLikePrefix(scopeFolderPath),
     search_pattern: toLikePattern(searchQuery),
+    search_tag_count: searchTags.length,
+    search_tags_json: JSON.stringify(searchTags),
     limit,
     offset
   }) as MediaFileRow[]
@@ -407,12 +615,16 @@ export function commitScanGeneration(folderPath: string, activeGeneration: numbe
 export function getDuplicateCandidatesPage(
   folderPath: string,
   afterPath: string,
-  limit: number
+  limit: number,
+  folderConstraint: string | null = null
 ): DuplicateCandidate[] {
   const rows = getStatements().getDuplicateCandidatesPage.all({
     folder_path: folderPath,
+    folder_prefix: toLikePrefix(folderPath),
     after_path: afterPath,
-    limit
+    limit,
+    folder_constraint: folderConstraint,
+    folder_constraint_prefix: toLikePrefix(folderConstraint ?? folderPath)
   }) as Array<{
     file_path: string
     type: MediaType
@@ -440,11 +652,16 @@ export function savePerceptualHashes(updates: PerceptualHashUpdate[]): void {
   if (updates.length > 0) getStatements().saveHashes(updates)
 }
 
+export function saveMediaMetadata(updates: MediaMetadataUpdate[]): void {
+  if (updates.length > 0) getStatements().saveMetadata(updates)
+}
+
 export function saveDuplicateGroups(
   folderPath: string,
-  assignments: DuplicateGroupAssignment[]
+  assignments: DuplicateGroupAssignment[],
+  folderConstraint: string | null = null
 ): void {
-  getStatements().saveGroups(folderPath, assignments)
+  getStatements().saveGroups(folderPath, assignments, folderConstraint)
 }
 
 export function markAsTrash(fileId: string): MoveToTrashResult {
@@ -455,11 +672,20 @@ export function restoreFromTrash(fileId: string): boolean {
   return getStatements().restoreTrash.run(fileId).changes > 0
 }
 
-export function countTrashInFolder(folderPath: string, searchQuery = ''): number {
+export function countTrashInFolder(
+  folderPath: string,
+  searchQuery = '',
+  searchTags: readonly string[] = [],
+  activeFolderPath: string | null = null
+): number {
+  const scopeFolderPath = activeFolderPath ?? folderPath
   const row = getStatements().countCatalogPage.get({
-    folder_path: folderPath,
+    scope_folder_path: scopeFolderPath,
+    scope_folder_prefix: toLikePrefix(scopeFolderPath),
     status: 'trash',
-    search_pattern: toLikePattern(searchQuery)
+    search_pattern: toLikePattern(searchQuery),
+    search_tag_count: searchTags.length,
+    search_tags_json: JSON.stringify(searchTags)
   }) as { count: number }
   return row.count
 }
@@ -467,13 +693,19 @@ export function countTrashInFolder(folderPath: string, searchQuery = ''): number
 export function getTrashInFolderPage(
   folderPath: string,
   searchQuery: string,
+  searchTags: readonly string[],
   sortBy: CatalogSortBy,
   limit: number,
-  offset: number
+  offset: number,
+  activeFolderPath: string | null = null
 ): MediaFileData[] {
+  const scopeFolderPath = activeFolderPath ?? folderPath
   const rows = getStatements().catalogPages.trash[sortBy].all({
-    folder_path: folderPath,
+    scope_folder_path: scopeFolderPath,
+    scope_folder_prefix: toLikePrefix(scopeFolderPath),
     search_pattern: toLikePattern(searchQuery),
+    search_tag_count: searchTags.length,
+    search_tags_json: JSON.stringify(searchTags),
     limit,
     offset
   }) as MediaFileRow[]
@@ -520,9 +752,53 @@ export function getMediaReferences(fileIds: string[]): CatalogMediaReference[] {
   return files
 }
 
+export function addTagToFile(fileId: string, tagName: string): TagMutationResult {
+  return getStatements().addFileTag(fileId, tagName)
+}
+
+export function removeTagFromFile(fileId: string, tagName: string): TagMutationResult {
+  return getStatements().removeFileTag(fileId, tagName)
+}
+
+export function getAllTags(): TagRecord[] {
+  return readTagRecords(getStatements().getAllTags.all())
+}
+
+export function deleteGlobalTag(tagId: number): boolean {
+  return getStatements().deleteGlobalTagStatement.run(tagId).changes > 0
+}
+
+export function renameGlobalTag(tagId: number, newName: string): TagRecord {
+  let row: unknown
+  try {
+    row = getStatements().renameGlobalTagStatement.get(newName, tagId)
+  } catch (error) {
+    if (isUniqueConstraintError(error)) throw new Error('A tag with that name already exists.')
+    throw error
+  }
+  const [tag] = readTagRecords(row ? [row] : [])
+  if (!tag) throw new Error('The tag no longer exists.')
+  return tag
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && String((error as Error & { code?: unknown }).code).startsWith('SQLITE_CONSTRAINT')
+}
+
 function toLikePattern(searchQuery: string): string {
   const escapedQuery = searchQuery.replace(/[!%_]/g, '!$&')
   return `%${escapedQuery}%`
+}
+
+function toLikePrefix(folderPath: string): string {
+  const separator = folderPath.includes('\\') ? '\\' : '/'
+  const base = folderPath.endsWith('\\') || folderPath.endsWith('/')
+    ? folderPath.slice(0, -1)
+    : folderPath
+  const escaped = base.replace(/[!%_]/g, '!$&')
+  return `${escaped}${separator}%`
 }
 
 function toBindings(
@@ -540,7 +816,8 @@ function toBindings(
     duration: file.duration,
     fps: file.fps,
     last_modified: file.lastModified,
-    scan_generation: activeGeneration
+    scan_generation: activeGeneration,
+    flag_reason: file.flagReason ?? null
   }
 }
 
@@ -557,6 +834,33 @@ function fromRow(row: MediaFileRow): MediaFileData {
     duration: row.duration,
     fps: row.fps,
     lastModified: row.last_modified,
-    duplicateGroupId: row.duplicate_group_id
+    duplicateGroupId: row.duplicate_group_id,
+    flagReason: row.flag_reason,
+    tags: parseTags(row.tags_json)
+  }
+}
+
+function readTagNames(rows: unknown[]): string[] {
+  return rows.flatMap((row) => {
+    if (typeof row !== 'object' || row === null || !('name' in row)) return []
+    return typeof row.name === 'string' ? [row.name] : []
+  })
+}
+
+function readTagRecords(rows: unknown[]): TagRecord[] {
+  return rows.flatMap((row) => {
+    if (typeof row !== 'object' || row === null || !('id' in row) || !('name' in row)) return []
+    return Number.isSafeInteger(row.id) && typeof row.name === 'string'
+      ? [{ id: row.id as number, name: row.name }]
+      : []
+  })
+}
+
+function parseTags(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.filter((tag): tag is string => typeof tag === 'string') : []
+  } catch {
+    return []
   }
 }

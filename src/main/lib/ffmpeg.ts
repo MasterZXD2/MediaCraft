@@ -28,6 +28,8 @@ export interface VideoMetadata {
   duration: number | null
   width: number | null
   height: number | null
+  fps: number | null
+  hasVideoStream: boolean
 }
 
 export interface FfmpegOptions {
@@ -93,7 +95,7 @@ export async function probeVideo(
       '-select_streams',
       'v:0',
       '-show_entries',
-      'stream=width,height,duration:format=duration',
+      'stream=width,height,duration,avg_frame_rate,r_frame_rate:format=duration',
       '-of',
       'json',
       sourcePath
@@ -103,14 +105,22 @@ export async function probeVideo(
 
   try {
     const parsed = JSON.parse(result.stdout.toString('utf8')) as {
-      streams?: Array<{ width?: number; height?: number; duration?: string }>
+      streams?: Array<{
+        width?: number
+        height?: number
+        duration?: string
+        avg_frame_rate?: string
+        r_frame_rate?: string
+      }>
       format?: { duration?: string }
     }
     const stream = parsed.streams?.[0]
     return {
       duration: parseNumber(stream?.duration ?? parsed.format?.duration),
       width: parseNumber(stream?.width),
-      height: parseNumber(stream?.height)
+      height: parseNumber(stream?.height),
+      fps: parseFrameRate(stream?.avg_frame_rate) ?? parseFrameRate(stream?.r_frame_rate),
+      hasVideoStream: stream !== undefined
     }
   } catch (error) {
     throw new FfmpegError(
@@ -120,6 +130,18 @@ export async function probeVideo(
       result.stderr
     )
   }
+}
+
+function parseFrameRate(value: string | undefined): number | null {
+  if (!value) return null
+  const [numeratorText, denominatorText] = value.split('/', 2)
+  const numerator = Number(numeratorText)
+  const denominator = denominatorText === undefined ? 1 : Number(denominatorText)
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || numerator <= 0 || denominator <= 0) {
+    return null
+  }
+  const fps = numerator / denominator
+  return Number.isFinite(fps) && fps > 0 ? fps : null
 }
 
 export async function extractVideoDHashPixels(

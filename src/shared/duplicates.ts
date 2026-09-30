@@ -33,6 +33,7 @@ export interface HashedMediaItem {
 export interface FindDuplicatesInput {
   folderPath: string
   threshold?: number
+  scanRoot?: string | null
 }
 
 export interface DuplicateDetectionResult {
@@ -58,6 +59,7 @@ export interface DuplicateProgressEvent extends DuplicateProgressData {
 
 export interface DuplicateGroupsUpdateData {
   folderPath: string
+  scanRoot: string | null
   assignments: DuplicateGroupAssignment[]
   reset: boolean
   complete: boolean
@@ -72,5 +74,6 @@ export type HashWorkerMessage =
   | { type: 'ready' }
   | { type: 'hash-result'; jobId: string; perceptualHash: string }
   | { type: 'group-result'; jobId: string; groups: string[][] }
+  | { type: 'debug-log'; jobId: string; message: string }
   | { type: 'job-error'; jobId: string; message: string }
   | { type: 'shutdown-complete' }

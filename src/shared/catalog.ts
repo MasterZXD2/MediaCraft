@@ -1,4 +1,4 @@
-import type { MediaFile } from './media'
+import type { MediaFile, MediaMetadataUpdate } from './media'
 import type {
   DuplicateCandidate,
   DuplicateGroupAssignment,
@@ -6,6 +6,7 @@ import type {
 } from './duplicates'
 import type { MoveToTrashResult } from './cleanup'
 import type { CatalogMediaReference } from './transform'
+import type { TagMutationResult, TagRecord } from './tags'
 
 export interface CatalogScanRequest {
   requestId: string
@@ -16,7 +17,9 @@ export type CatalogSortBy = 'date_desc' | 'date_asc' | 'name_asc' | 'size_desc'
 
 export interface CatalogQueryOptions {
   searchQuery: string
+  searchTags: string[]
   sortBy: CatalogSortBy
+  activeFolderPath: string | null
 }
 
 export interface CatalogQueryInput extends CatalogScanRequest, CatalogQueryOptions {}
@@ -70,12 +73,20 @@ export type CatalogWorkerCommand =
   | { type: 'cancel'; requestId: string }
   | ({ type: 'query-catalog' } & CatalogQueryInput)
   | { type: 'cancel-query'; requestId: string }
-  | { type: 'get-duplicate-candidates'; requestId: string; folderPath: string }
+  | {
+      type: 'get-duplicate-candidates'
+      requestId: string
+      folderPath: string
+      folderConstraint: string | null
+    }
+  | { type: 'duplicate-candidates-next'; requestId: string }
+  | { type: 'cancel-duplicate-candidates'; requestId: string }
   | { type: 'save-perceptual-hashes'; requestId: string; updates: PerceptualHashUpdate[] }
   | {
       type: 'save-duplicate-groups'
       requestId: string
       folderPath: string
+      folderConstraint: string | null
       assignments: DuplicateGroupAssignment[]
     }
   | { type: 'mark-as-trash'; requestId: string; filePath: string }
@@ -83,6 +94,13 @@ export type CatalogWorkerCommand =
   | { type: 'get-trash-paths'; requestId: string; folderPath: string }
   | { type: 'delete-trash-records'; requestId: string; filePaths: string[] }
   | { type: 'get-media-references'; requestId: string; fileIds: string[] }
+  | { type: 'save-media-metadata'; requestId: string; updates: MediaMetadataUpdate[] }
+  | { type: 'add-tag'; requestId: string; filePath: string; tagName: string }
+  | { type: 'remove-tag'; requestId: string; filePath: string; tagName: string }
+  | { type: 'get-all-tags'; requestId: string }
+  | { type: 'delete-global-tag'; requestId: string; tagId: number }
+  | { type: 'rename-global-tag'; requestId: string; tagId: number; newName: string }
+  | { type: 'get-folder-tree'; requestId: string; datasetRoot: string }
   | { type: 'shutdown' }
 
 export type CatalogWorkerMessage =
@@ -97,5 +115,11 @@ export type CatalogWorkerMessage =
   | { type: 'trash-paths-complete'; requestId: string; total: number }
   | { type: 'trash-delete-complete'; requestId: string; deletedCount: number }
   | { type: 'media-references-complete'; requestId: string; files: CatalogMediaReference[] }
+  | { type: 'media-metadata-write-complete'; requestId: string }
+  | { type: 'tag-write-complete'; requestId: string; result: TagMutationResult }
+  | { type: 'all-tags-complete'; requestId: string; tags: TagRecord[] }
+  | { type: 'tag-delete-complete'; requestId: string; deleted: boolean }
+  | { type: 'tag-rename-complete'; requestId: string; tag: TagRecord }
+  | { type: 'folder-tree-complete'; requestId: string; folderPaths: string[] }
   | { type: 'duplicate-request-error'; requestId: string; message: string }
   | CatalogStreamEvent

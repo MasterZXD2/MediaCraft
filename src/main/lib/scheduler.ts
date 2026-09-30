@@ -1,5 +1,6 @@
 import { generateThumbnail } from './thumbnail'
-import type { MediaType } from '../../shared/media'
+import { validateMedia, type MediaValidationResult } from './validator'
+import type { MediaType, ValidationFlagReason } from '../../shared/media'
 
 export type MediaJobPriority = 'high' | 'low'
 
@@ -8,11 +9,19 @@ export interface ThumbnailJob {
   sourcePath: string
   type: MediaType
   generation: number
+  sizeBytes: number
+  lastModified: number
+  width: number | null
+  height: number | null
+  duration: number | null
+  fps: number | null
+  flagReason: ValidationFlagReason | null
 }
 
 export interface ThumbnailJobResult {
   job: ThumbnailJob
   thumbnailPath: string | null
+  validation: MediaValidationResult | null
 }
 
 export interface ThumbnailSchedulerCallbacks {
@@ -249,11 +258,18 @@ export class PriorityMediaScheduler {
   private async run(job: QueuedJob, controller: AbortController): Promise<void> {
     let error: unknown | null = null
     let thumbnailPath: string | null = null
+    let validation: MediaValidationResult | null = null
     try {
       if (job.kind === 'thumbnail') {
-        thumbnailPath = await generateThumbnail(job.sourcePath, job.type, {
+        validation = reusableValidation(job) ?? await validateMedia(job.sourcePath, job.type, {
+          sizeBytes: job.sizeBytes,
           signal: controller.signal
         })
+        if (validation.flagReason !== 'CORRUPT') {
+          thumbnailPath = await generateThumbnail(job.sourcePath, job.type, {
+            signal: controller.signal
+          })
+        }
       } else {
         await job.execute(controller.signal)
       }
@@ -271,7 +287,13 @@ export class PriorityMediaScheduler {
           generationProgress.current++
           if (!cancelled) this.callbacks.onProgress({ generation: job.generation, ...generationProgress })
         }
-        if (!cancelled) this.callbacks.onComplete({ job, thumbnailPath: error ? null : thumbnailPath })
+        if (!cancelled) {
+          this.callbacks.onComplete({
+            job,
+            thumbnailPath: error ? null : thumbnailPath,
+            validation: error ? null : validation
+          })
+        }
       } else {
         this.notifyBackgroundSettled(job, error)
       }
@@ -303,4 +325,43 @@ export class PriorityMediaScheduler {
   private laneFor(type: MediaType): JobLane {
     return type === 'image' ? 'image' : 'video'
   }
+}
+
+function reusableValidation(job: ThumbnailJob): MediaValidationResult | null {
+  if (job.flagReason !== null) {
+    return {
+      width: job.width,
+      height: job.height,
+      duration: job.duration,
+      fps: job.fps,
+      flagReason: job.flagReason
+    }
+  }
+  if (job.type === 'image' && job.width !== null && job.height !== null) {
+    return {
+      width: job.width,
+      height: job.height,
+      duration: null,
+      fps: null,
+      flagReason: null
+    }
+  }
+  if (
+    job.type === 'video'
+    && job.width !== null
+    && job.height !== null
+    && job.duration !== null
+    && job.duration > 0
+    && job.fps !== null
+    && job.fps > 0
+  ) {
+    return {
+      width: job.width,
+      height: job.height,
+      duration: job.duration,
+      fps: job.fps,
+      flagReason: null
+    }
+  }
+  return null
 }

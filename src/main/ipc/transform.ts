@@ -17,10 +17,13 @@ import {
   type PriorityMediaScheduler
 } from '../lib/scheduler'
 import {
+  extractVideoThumbnails,
   outputExtensionForImage,
+  outputExtensionForVideo,
   transformImage,
   transformVideo
 } from '../lib/transformer'
+import { authorizedVideoPath } from '../lib/mediaAuthorization'
 import type {
   CatalogMediaReference,
   ImageOutputFormat,
@@ -30,12 +33,21 @@ import type {
   TransformProgressData,
   VideoCodec,
   VideoPreset,
+  VideoTransformMode,
   VideoTransformOptions
 } from '../../shared/transform'
 
 const MAX_BATCH_SIZE = 5_000
 const MAX_IMAGE_DIMENSION = 16_384
 const VIDEO_CODECS = new Set<VideoCodec>(['libx264', 'libx265'])
+const VIDEO_MODES = new Set<VideoTransformMode>([
+  'encode',
+  'remux',
+  'extract_mp3',
+  'snapshot',
+  'trim',
+  'mute_video'
+])
 const IMAGE_FORMATS = new Set<ImageOutputFormat>(['source', 'jpeg', 'png', 'webp', 'avif'])
 const VIDEO_PRESETS = new Set<VideoPreset>([
   'ultrafast',
@@ -63,7 +75,8 @@ export class TransformIpcController {
 
   constructor(
     private readonly catalog: CatalogWorkerCoordinator,
-    private readonly scheduler: PriorityMediaScheduler
+    private readonly scheduler: PriorityMediaScheduler,
+    private readonly isSourceAllowed: (filePath: string) => boolean
   ) {}
 
   register(): void {
@@ -94,6 +107,21 @@ export class TransformIpcController {
       return outputDirectory
     })
 
+    ipcMain.handle('extract-video-thumbnails', async (event, videoPath: unknown, count: unknown) => {
+      if (typeof videoPath !== 'string' || videoPath.length === 0) {
+        throw new Error('Video path must be a non-empty string.')
+      }
+      if (!Number.isInteger(count) || (count as number) < 1 || (count as number) > 20) {
+        throw new Error('Thumbnail count must be an integer from 1 to 20.')
+      }
+      const fileId = resolve(videoPath)
+      const references = await this.catalog.getMediaReferences([fileId])
+      if (event.sender.isDestroyed()) throw new Error('The requesting window was closed.')
+      const sourcePath = authorizedVideoPath(fileId, references, this.isSourceAllowed)
+      const result = await extractVideoThumbnails(sourcePath, count as number)
+      return result.thumbnails
+    })
+
     ipcMain.handle('transform-media', (event, input: unknown) => this.startBatch(event, input))
     ipcMain.handle('cancel-transform', (event, batchId: unknown) => {
       if (typeof batchId !== 'string' || batchId.length === 0) return false
@@ -107,6 +135,7 @@ export class TransformIpcController {
   shutdown(): void {
     if (!this.registered) return
     ipcMain.removeHandler('select-transform-output-directory')
+    ipcMain.removeHandler('extract-video-thumbnails')
     ipcMain.removeHandler('transform-media')
     ipcMain.removeHandler('cancel-transform')
     for (const [batchId, batch] of this.activeBatches) {
@@ -224,7 +253,7 @@ export class TransformIpcController {
         const destinationDirectory = join(outputDirectory, sourceSubdirectory)
         const extension = reference.type === 'image'
           ? outputExtensionForImage(reference.filePath, input.options.image.format)
-          : '.mp4'
+          : outputExtensionForVideo(reference.filePath, input.options.video)
         const sourceExtension = extname(reference.filename)
         const sourceStem = basename(reference.filename, sourceExtension)
         const basePath = join(destinationDirectory, `${sourceStem}_transformed${extension}`)
@@ -323,11 +352,63 @@ function parseImageOptions(value: unknown): ImageTransformOptions {
       ...(quality !== undefined ? { quality } : {})
     }
   }
-  throw new Error('Image resize mode must be long_edge or exact.')
+  if (value.mode === 'crop') {
+    if (!isRecord(value.cropRect)) {
+      throw new Error('Crop mode requires a valid cropRect.')
+    }
+    const cropRect = value.cropRect
+    return {
+      mode: 'crop',
+      cropRect: {
+        x: requiredNumber(cropRect.x, 'Crop x', 0, MAX_IMAGE_DIMENSION),
+        y: requiredNumber(cropRect.y, 'Crop y', 0, MAX_IMAGE_DIMENSION),
+        width: requiredNumber(cropRect.width, 'Crop width', 1, MAX_IMAGE_DIMENSION),
+        height: requiredNumber(cropRect.height, 'Crop height', 1, MAX_IMAGE_DIMENSION)
+      },
+      format,
+      ...(quality !== undefined ? { quality } : {})
+    }
+  }
+  if (value.mode === 'adjust_image') {
+    const rotate = value.rotate !== undefined
+      ? optionalInteger(value.rotate, 'Rotate angle', -360, 360)
+      : undefined
+    const flipHorizontal = optionalBoolean(value.flipHorizontal, 'Flip horizontal')
+    const flipVertical = optionalBoolean(value.flipVertical, 'Flip vertical')
+    return {
+      mode: 'adjust_image',
+      ...(rotate !== undefined ? { rotate } : {}),
+      ...(flipHorizontal !== undefined ? { flipHorizontal } : {}),
+      ...(flipVertical !== undefined ? { flipVertical } : {}),
+      format,
+      ...(quality !== undefined ? { quality } : {})
+    }
+  }
+  throw new Error('Image mode must be long_edge, exact, crop, or adjust_image.')
 }
 
 function parseVideoOptions(value: unknown): VideoTransformOptions {
-  if (!isRecord(value) || !VIDEO_CODECS.has(value.codec as VideoCodec)) {
+  if (!isRecord(value)) throw new Error('Invalid video transform options.')
+  const mode = value.mode === undefined ? 'encode' : value.mode
+  if (!VIDEO_MODES.has(mode as VideoTransformMode)) {
+    throw new Error('Video mode must be encode, remux, extract_mp3, snapshot, or trim.')
+  }
+  if (mode === 'remux') return { mode: 'remux' }
+  if (mode === 'mute_video') return { mode: 'mute_video' }
+  if (mode === 'extract_mp3') return { mode: 'extract_mp3' }
+  if (mode === 'snapshot') {
+    return {
+      mode: 'snapshot',
+      timestamp: requiredNumber(value.timestamp, 'Snapshot timestamp', 0, 86_400)
+    }
+  }
+  if (mode === 'trim') {
+    const trimStart = requiredNumber(value.trimStart, 'Trim start', 0, 604_800)
+    const trimEnd = requiredNumber(value.trimEnd, 'Trim end', 0, 604_800)
+    if (trimEnd <= trimStart) throw new Error('Trim end must be greater than trim start.')
+    return { mode: 'trim', trimStart, trimEnd }
+  }
+  if (!VIDEO_CODECS.has(value.codec as VideoCodec)) {
     throw new Error('Video codec must be libx264 or libx265.')
   }
   if (value.preset !== undefined && !VIDEO_PRESETS.has(value.preset as VideoPreset)) {
@@ -337,6 +418,7 @@ function parseVideoOptions(value: unknown): VideoTransformOptions {
   const crf = optionalInteger(value.crf, 'Video CRF', 0, 51)
   const skipUpscale = optionalBoolean(value.skipUpscale, 'skipUpscale')
   return {
+    mode: 'encode',
     codec: value.codec as VideoCodec,
     targetHeight: requiredInteger(value.targetHeight, 'Target video height', 2, 16_384),
     audioBitrateKbps: requiredInteger(value.audioBitrateKbps, 'Audio bitrate', 16, 1_536),
@@ -393,6 +475,23 @@ function requiredInteger(
     throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`)
   }
   return value as number
+}
+
+function requiredNumber(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isFinite(value)
+    || value < minimum
+    || value > maximum
+  ) {
+    throw new Error(`${label} must be a number from ${minimum} to ${maximum}.`)
+  }
+  return value
 }
 
 function optionalInteger(

@@ -1,4 +1,5 @@
 import { parentPort } from 'node:worker_threads'
+import { basename } from 'node:path'
 import sharp from 'sharp'
 import { extractVideoDHashPixels } from '../lib/ffmpeg'
 import type {
@@ -34,18 +35,35 @@ async function processCommand(message: Exclude<HashWorkerCommand, { type: 'shutd
   try {
     if (message.type === 'hash') {
       const pixels = await loadDHashPixels(message.filePath, message.mediaType)
+      const perceptualHash = createDHash(pixels)
+      postMessage({
+        type: 'debug-log',
+        jobId: message.jobId,
+        message: `[HASH] Extracted 64-bit dHash for ${basename(message.filePath)} -> 0x${perceptualHash}`
+      })
       postMessage({
         type: 'hash-result',
         jobId: message.jobId,
-        perceptualHash: createDHash(pixels)
+        perceptualHash
       })
       return
     }
 
     postMessage({
+      type: 'debug-log',
+      jobId: message.jobId,
+      message: `[GROUP] Comparing ${message.items.length} hashed items with Hamming threshold ${message.threshold}.`
+    })
+    postMessage({
       type: 'group-result',
       jobId: message.jobId,
-      groups: groupSimilarHashes(message.items, message.threshold)
+      groups: groupSimilarHashes(message.items, message.threshold, (leftPath, rightPath, distance) => {
+        postMessage({
+          type: 'debug-log',
+          jobId: message.jobId,
+          message: `[COMPARE] Hamming distance between ${basename(leftPath)} and ${basename(rightPath)} = ${distance} (MATCH)`
+        })
+      })
     })
   } catch (error) {
     postMessage({
@@ -89,7 +107,11 @@ function createDHash(pixels: Uint8Array): string {
   return hash.toString(16).padStart(16, '0')
 }
 
-function groupSimilarHashes(items: HashedMediaItem[], threshold: number): string[][] {
+function groupSimilarHashes(
+  items: HashedMediaItem[],
+  threshold: number,
+  onMatch?: (leftPath: string, rightPath: string, distance: number) => void
+): string[][] {
   if (!Number.isInteger(threshold) || threshold < 0 || threshold > 64) {
     throw new Error('Hamming threshold must be an integer between 0 and 64.')
   }
@@ -101,7 +123,9 @@ function groupSimilarHashes(items: HashedMediaItem[], threshold: number): string
     const item = items[index]
     validateHash(item.perceptualHash)
     const tree = trees.get(item.type) ?? new BKTree()
-    for (const matchingIndex of tree.search(item.perceptualHash, threshold)) {
+    for (const matchingIndex of tree.search(item.perceptualHash, threshold, (index, distance) => {
+      onMatch?.(item.filePath, items[index].filePath, distance)
+    })) {
       unionFind.union(index, matchingIndex)
     }
     tree.add(item.perceptualHash, index)
@@ -156,7 +180,7 @@ class BKTree {
     }
   }
 
-  search(hash: string, threshold: number): number[] {
+  search(hash: string, threshold: number, onMatch?: (index: number, distance: number) => void): number[] {
     if (!this.root) return []
     const matches: number[] = []
     const pending = [this.root]
@@ -164,7 +188,10 @@ class BKTree {
     while (pending.length > 0) {
       const node = pending.pop()!
       const distance = hammingDistance(hash, node.hash)
-      if (distance <= threshold) matches.push(...node.indexes)
+      if (distance <= threshold) {
+        matches.push(...node.indexes)
+        for (const index of node.indexes) onMatch?.(index, distance)
+      }
 
       const minimum = Math.max(0, distance - threshold)
       const maximum = distance + threshold

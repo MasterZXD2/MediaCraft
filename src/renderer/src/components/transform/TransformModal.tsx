@@ -23,6 +23,8 @@ interface TransformModalProps {
   onOpenChange: (open: boolean) => void
 }
 
+type VideoBatchTransformMode = 'encode' | 'remux' | 'extract_mp3'
+
 export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX.Element {
   const selectedIds = useMediaStore((state) => state.selectedIds)
   const isStarting = useMediaStore((state) => state.isTransformStarting)
@@ -47,6 +49,7 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
   const [imageHeight, setImageHeight] = useState(1080)
   const [imageFormat, setImageFormat] = useState<ImageOutputFormat>('source')
   const [imageQuality, setImageQuality] = useState(82)
+  const [videoMode, setVideoMode] = useState<VideoBatchTransformMode>('encode')
   const [videoCodec, setVideoCodec] = useState<VideoCodec>('libx264')
   const [videoHeight, setVideoHeight] = useState(1080)
   const [audioBitrate, setAudioBitrate] = useState(128)
@@ -71,17 +74,20 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
           format: imageFormat,
           quality: imageQuality
         }
-    const options: TransformBatchOptions = {
-      image,
-      video: {
-        codec: videoCodec,
-        targetHeight: videoHeight,
-        audioBitrateKbps: audioBitrate,
-        crf: videoCrf,
-        preset: videoPreset,
-        skipUpscale
-      }
-    }
+    const video = videoMode === 'encode'
+      ? {
+          mode: 'encode' as const,
+          codec: videoCodec,
+          targetHeight: videoHeight,
+          audioBitrateKbps: audioBitrate,
+          crf: videoCrf,
+          preset: videoPreset,
+          skipUpscale
+        }
+      : videoMode === 'remux'
+        ? { mode: 'remux' as const }
+        : { mode: 'extract_mp3' as const }
+    const options: TransformBatchOptions = { image, video }
 
     if (await startTransform(options)) onOpenChange(false)
   }
@@ -159,51 +165,79 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
             <section className="border-t border-border pt-4">
               <SectionHeading icon={Film} title="Video Settings" count={selection.videos} />
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                <Field label="Video codec" className="sm:col-span-2">
-                  <div className="grid grid-cols-2 rounded-md border border-border bg-background/60 p-1">
-                    <ModeButton
-                      active={videoCodec === 'libx264'}
-                      onClick={() => {
-                        setVideoCodec('libx264')
-                        setVideoCrf(23)
-                      }}
-                    >
-                      H.264
-                    </ModeButton>
-                    <ModeButton
-                      active={videoCodec === 'libx265'}
-                      onClick={() => {
-                        setVideoCodec('libx265')
-                        setVideoCrf(28)
-                      }}
-                    >
-                      H.265
-                    </ModeButton>
-                  </div>
-                </Field>
-                <Field label="Target height (px)">
-                  <NumberInput value={videoHeight} min={2} max={16384} step={2} onChange={setVideoHeight} />
-                </Field>
-                <Field label="Audio bitrate (kbps)">
-                  <NumberInput value={audioBitrate} min={16} max={1536} onChange={setAudioBitrate} />
-                </Field>
-                <Field label="CRF quality">
-                  <NumberInput value={videoCrf} min={0} max={51} onChange={setVideoCrf} />
-                </Field>
-                <Field label="Encoding preset">
-                  <Select value={videoPreset} onChange={(value) => setVideoPreset(value as VideoPreset)}>
-                    <option value="veryfast">Very fast</option>
-                    <option value="faster">Faster</option>
-                    <option value="fast">Fast</option>
-                    <option value="medium">Medium</option>
-                    <option value="slow">Slow</option>
+                <Field label="Conversion mode" className="sm:col-span-2">
+                  <Select
+                    value={videoMode}
+                    onChange={(value) => setVideoMode(value as VideoBatchTransformMode)}
+                  >
+                    <option value="encode">Re-encode Video (H.264 / H.265)</option>
+                    <option value="remux">Fast Remux to MP4 (No quality loss)</option>
+                    <option value="extract_mp3">Extract Audio only (MP3)</option>
                   </Select>
                 </Field>
+
+                {videoMode === 'encode' && (
+                  <>
+                    <Field label="Video codec" className="sm:col-span-2">
+                      <div className="grid grid-cols-2 rounded-md border border-border bg-background/60 p-1">
+                        <ModeButton
+                          active={videoCodec === 'libx264'}
+                          onClick={() => {
+                            setVideoCodec('libx264')
+                            setVideoCrf(23)
+                          }}
+                        >
+                          H.264
+                        </ModeButton>
+                        <ModeButton
+                          active={videoCodec === 'libx265'}
+                          onClick={() => {
+                            setVideoCodec('libx265')
+                            setVideoCrf(28)
+                          }}
+                        >
+                          H.265
+                        </ModeButton>
+                      </div>
+                    </Field>
+                    <Field label="Target height (px)">
+                      <NumberInput value={videoHeight} min={2} max={16384} step={2} onChange={setVideoHeight} />
+                    </Field>
+                    <Field label="Audio bitrate (kbps)">
+                      <NumberInput value={audioBitrate} min={16} max={1536} onChange={setAudioBitrate} />
+                    </Field>
+                    <Field label="CRF quality">
+                      <NumberInput value={videoCrf} min={0} max={51} onChange={setVideoCrf} />
+                    </Field>
+                    <Field label="Encoding preset">
+                      <Select value={videoPreset} onChange={(value) => setVideoPreset(value as VideoPreset)}>
+                        <option value="veryfast">Very fast</option>
+                        <option value="faster">Faster</option>
+                        <option value="fast">Fast</option>
+                        <option value="medium">Medium</option>
+                        <option value="slow">Slow</option>
+                      </Select>
+                    </Field>
+                  </>
+                )}
+
+                {videoMode === 'remux' && (
+                  <p className="sm:col-span-2 text-[10px] leading-relaxed text-muted-foreground">
+                    Streams are copied directly into an MP4 container. Video and audio quality are unchanged;
+                    subtitle streams are omitted for MP4 compatibility.
+                  </p>
+                )}
+
+                {videoMode === 'extract_mp3' && (
+                  <p className="sm:col-span-2 text-[10px] leading-relaxed text-muted-foreground">
+                    The first audio stream is encoded as high-quality MP3. Video and subtitle streams are omitted.
+                  </p>
+                )}
+
               </div>
             </section>
           )}
-
-          {(selection.videos > 0 || imageMode === 'long_edge') && (
+          {(((selection.videos > 0 && videoMode === 'encode') || (selection.images > 0 && imageMode === 'long_edge')) && (
             <label className="flex items-center gap-2.5 border-t border-border pt-4 text-xs text-muted-foreground">
               <input
                 type="checkbox"
@@ -213,7 +247,7 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
               />
               Do not enlarge media smaller than the requested dimensions
             </label>
-          )}
+          ))}
 
           {transformError && <p className="text-xs text-destructive">{transformError}</p>}
 

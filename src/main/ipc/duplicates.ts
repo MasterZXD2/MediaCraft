@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve } from 'node:path'
 import { DuplicateDetector } from '../lib/duplicateDetector'
 import type { CatalogWorkerCoordinator } from './scanner'
 import type {
@@ -33,16 +33,24 @@ export class DuplicateIpcController {
       if (!this.isFolderAllowed(folderPath)) {
         throw new Error('Choose this directory with the folder picker before finding duplicates.')
       }
+      const scanRoot = parsed.scanRoot ? resolve(parsed.scanRoot) : null
+      if (scanRoot && !isPathWithin(folderPath, scanRoot)) {
+        throw new Error('The duplicate scan folder must be inside the selected dataset.')
+      }
 
       return this.detector.findDuplicates(
         folderPath,
+        scanRoot,
         parsed.threshold,
         (progress) => {
           if (!event.sender.isDestroyed()) {
             event.sender.send('duplicate-progress', { ...progress, folderPath })
           }
         },
-        (assignments) => sendGroupUpdates(event.sender, folderPath, assignments)
+        (assignments) => sendGroupUpdates(event.sender, folderPath, scanRoot, assignments),
+        (message) => {
+          if (!event.sender.isDestroyed()) event.sender.send('duplicate-debug-log', message)
+        }
       )
     })
   }
@@ -59,11 +67,13 @@ export class DuplicateIpcController {
 function sendGroupUpdates(
   webContents: Electron.WebContents,
   folderPath: string,
+  scanRoot: string | null,
   assignments: DuplicateGroupAssignment[]
 ): void {
   if (webContents.isDestroyed()) return
   webContents.send('duplicate-groups-updated', {
     folderPath,
+    scanRoot,
     assignments: [],
     reset: true,
     complete: assignments.length === 0
@@ -74,6 +84,7 @@ function sendGroupUpdates(
     const chunk = assignments.slice(offset, offset + GROUP_UPDATE_CHUNK_SIZE)
     webContents.send('duplicate-groups-updated', {
       folderPath,
+      scanRoot,
       assignments: chunk,
       reset: false,
       complete: offset + chunk.length >= assignments.length
@@ -94,7 +105,21 @@ function parseInput(input: unknown): FindDuplicatesInput {
   )) {
     throw new Error('Hamming threshold must be an integer between 0 and 64.')
   }
-  return { folderPath: candidate.folderPath, threshold: candidate.threshold }
+  if (candidate.scanRoot !== undefined && candidate.scanRoot !== null && (
+    typeof candidate.scanRoot !== 'string' || candidate.scanRoot.length === 0
+  )) {
+    throw new Error('The duplicate scan root is invalid.')
+  }
+  return {
+    folderPath: candidate.folderPath,
+    threshold: candidate.threshold,
+    scanRoot: candidate.scanRoot ?? null
+  }
+}
+
+function isPathWithin(rootPath: string, candidatePath: string): boolean {
+  const relativePath = relative(rootPath, candidatePath)
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath))
 }
 
 export type { DuplicateDetectionResult, DuplicateProgressData }

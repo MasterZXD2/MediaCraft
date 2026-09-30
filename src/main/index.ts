@@ -1,14 +1,16 @@
 import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell, type WebContents } from 'electron'
-import { join, normalize, resolve } from 'node:path'
+import { join, normalize, relative, resolve, isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { CatalogWorkerCoordinator } from './ipc/scanner'
 import { DuplicateIpcController } from './ipc/duplicates'
 import { CleanupIpcController } from './ipc/cleanup'
 import { TransformIpcController } from './ipc/transform'
+import { OrganizeIpcController } from './ipc/organize'
+import { TagsIpcController } from './ipc/tags'
 import { PriorityMediaScheduler } from './lib/scheduler'
 import { initializeThumbnailCache } from './lib/thumbnail'
 import type { CatalogQueryInput, CatalogSortBy, CatalogStreamEvent } from '../shared/catalog'
-import type { MediaFile } from '../shared/media'
+import type { MediaFile, MediaMetadataUpdate } from '../shared/media'
 
 const MEDIA_PROTOCOL = 'mediacraft-media'
 const selectedDirectories = new Set<string>()
@@ -16,12 +18,19 @@ const allowedSourceFiles = new Set<string>()
 const allowedThumbnailFiles = new Set<string>()
 const thumbnailTargets = new Map<number, WebContents>()
 const queuedThumbnailIds = new Set<string>()
+const pendingMetadataUpdates = new Map<string, MediaMetadataUpdate>()
 const CATALOG_SORTS = new Set<CatalogSortBy>(['date_desc', 'date_asc', 'name_asc', 'size_desc'])
+const METADATA_BATCH_SIZE = 256
+const METADATA_FLUSH_DELAY_MS = 75
 let thumbnailRunId = 0
+let metadataFlushTimer: ReturnType<typeof setTimeout> | null = null
+let metadataWriteInFlight: Promise<void> | null = null
 let catalogWorker: CatalogWorkerCoordinator | null = null
 let duplicateIpc: DuplicateIpcController | null = null
 let cleanupIpc: CleanupIpcController | null = null
 let transformIpc: TransformIpcController | null = null
+let organizeIpc: OrganizeIpcController | null = null
+let tagsIpc: TagsIpcController | null = null
 let shutdownStarted = false
 let shutdownFinished = false
 
@@ -38,11 +47,23 @@ function normalizeForComparison(filePath: string): string {
 }
 
 const thumbnailScheduler = new PriorityMediaScheduler({
-  onComplete: ({ job, thumbnailPath }) => {
+  onComplete: ({ job, thumbnailPath, validation }) => {
     const webContents = thumbnailTargets.get(job.generation)
-    if (!thumbnailPath || !webContents || webContents.isDestroyed() || job.generation !== thumbnailRunId) return
-    allowedThumbnailFiles.add(normalizeForComparison(thumbnailPath))
-    webContents.send('thumbnail-ready', { filePath: job.sourcePath, thumbnailPath })
+    if (!webContents || webContents.isDestroyed() || job.generation !== thumbnailRunId) return
+
+    if (validation && metadataChanged(job, validation)) {
+      const update: MediaMetadataUpdate = {
+        filePath: job.sourcePath,
+        expectedLastModified: job.lastModified,
+        ...validation
+      }
+      queueMetadataUpdate(update)
+      webContents.send('media-metadata-ready', update)
+    }
+    if (thumbnailPath) {
+      allowedThumbnailFiles.add(normalizeForComparison(thumbnailPath))
+      webContents.send('thumbnail-ready', { filePath: job.sourcePath, thumbnailPath })
+    }
   },
   onProgress: ({ generation, current, total }) => {
     const webContents = thumbnailTargets.get(generation)
@@ -99,12 +120,30 @@ function registerIpcHandlers(coordinator: CatalogWorkerCoordinator): void {
     }
     if (thumbnailRunId === 0) throw new Error('Scan a media folder before querying its catalog.')
 
+    const activeFolderPath = query.activeFolderPath
+      ? resolve(query.activeFolderPath)
+      : null
+    if (activeFolderPath && !isPathWithin(folderPath, activeFolderPath)) {
+      throw new Error('The selected folder is outside the dataset root.')
+    }
+
     const runId = thumbnailRunId
     thumbnailTargets.set(runId, event.sender)
-    return coordinator.startQuery({ ...query, folderPath }, (catalogEvent) => {
+    return coordinator.startQuery({ ...query, folderPath, activeFolderPath }, (catalogEvent) => {
       if (runId !== thumbnailRunId || event.sender.isDestroyed()) return
       handleCatalogEvent(catalogEvent, event.sender, runId, queuedThumbnailIds)
     })
+  })
+
+  ipcMain.handle('get-folder-tree', (_event, datasetRoot: unknown) => {
+    if (typeof datasetRoot !== 'string' || datasetRoot.length === 0) {
+      throw new Error('A dataset root is required.')
+    }
+    const folderPath = resolve(datasetRoot)
+    if (!selectedDirectories.has(normalizeForComparison(folderPath))) {
+      throw new Error('The dataset root is not authorized.')
+    }
+    return coordinator.getFolderTree(folderPath)
   })
 
   ipcMain.on('visible-media-ids', (_event, ids: unknown) => {
@@ -148,7 +187,14 @@ function handleCatalogEvent(
         id: file.path,
         sourcePath: file.path,
         type: file.type,
-        generation: runId
+        generation: runId,
+        sizeBytes: file.size,
+        lastModified: file.lastModified,
+        width: file.width,
+        height: file.height,
+        duration: file.duration,
+        fps: file.fps,
+        flagReason: file.flagReason ?? null
       })
     }
     const progress = thumbnailScheduler.progressFor(runId)
@@ -161,6 +207,76 @@ function handleCatalogEvent(
   }
 
   webContents.send('catalog-event', event)
+}
+
+function metadataChanged(
+  job: {
+    width: number | null
+    height: number | null
+    duration: number | null
+    fps: number | null
+    flagReason: MediaMetadataUpdate['flagReason']
+  },
+  validation: Omit<MediaMetadataUpdate, 'filePath' | 'expectedLastModified'>
+): boolean {
+  return job.width !== validation.width
+    || job.height !== validation.height
+    || job.duration !== validation.duration
+    || job.fps !== validation.fps
+    || job.flagReason !== validation.flagReason
+}
+
+function queueMetadataUpdate(update: MediaMetadataUpdate): void {
+  pendingMetadataUpdates.set(normalizeForComparison(update.filePath), update)
+  if (pendingMetadataUpdates.size >= METADATA_BATCH_SIZE) {
+    void flushMetadataUpdates()
+    return
+  }
+  if (!metadataFlushTimer) {
+    metadataFlushTimer = setTimeout(() => {
+      metadataFlushTimer = null
+      void flushMetadataUpdates()
+    }, METADATA_FLUSH_DELAY_MS)
+    metadataFlushTimer.unref()
+  }
+}
+
+async function flushMetadataUpdates(): Promise<void> {
+  if (metadataWriteInFlight || !catalogWorker || pendingMetadataUpdates.size === 0) return
+  if (metadataFlushTimer) {
+    clearTimeout(metadataFlushTimer)
+    metadataFlushTimer = null
+  }
+
+  const updates: MediaMetadataUpdate[] = []
+  for (const [key, update] of pendingMetadataUpdates) {
+    pendingMetadataUpdates.delete(key)
+    updates.push(update)
+    if (updates.length >= METADATA_BATCH_SIZE) break
+  }
+
+  metadataWriteInFlight = catalogWorker.saveMediaMetadata(updates)
+    .catch((error) => console.warn(`Unable to persist media validation: ${getErrorMessage(error)}`))
+    .finally(() => {
+      metadataWriteInFlight = null
+      if (pendingMetadataUpdates.size > 0) void flushMetadataUpdates()
+    })
+  await metadataWriteInFlight
+}
+
+async function drainMetadataUpdates(): Promise<void> {
+  if (metadataFlushTimer) {
+    clearTimeout(metadataFlushTimer)
+    metadataFlushTimer = null
+  }
+  while (pendingMetadataUpdates.size > 0 || metadataWriteInFlight) {
+    if (metadataWriteInFlight) await metadataWriteInFlight
+    else await flushMetadataUpdates()
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function parseCatalogQuery(input: unknown): CatalogQueryInput {
@@ -180,12 +296,33 @@ function parseCatalogQuery(input: unknown): CatalogQueryInput {
   if (typeof value.sortBy !== 'string' || !CATALOG_SORTS.has(value.sortBy as CatalogSortBy)) {
     throw new Error('Invalid catalog sort order.')
   }
+  if (!Array.isArray(value.searchTags) || value.searchTags.length > 32) {
+    throw new Error('Invalid tag filters.')
+  }
+  if (value.activeFolderPath !== null && typeof value.activeFolderPath !== 'string') {
+    throw new Error('Invalid active folder path.')
+  }
+  const searchTags = value.searchTags.map((tag) => {
+    if (typeof tag !== 'string') throw new Error('Invalid tag filter.')
+    const normalized = tag.trim()
+    if (normalized.length === 0 || normalized.length > 48) throw new Error('Invalid tag filter.')
+    return normalized
+  })
   return {
     requestId: value.requestId,
     folderPath: value.folderPath,
     searchQuery: value.searchQuery.trim(),
-    sortBy: value.sortBy as CatalogSortBy
+    searchTags: Array.from(new Set(searchTags)),
+    sortBy: value.sortBy as CatalogSortBy,
+    activeFolderPath: typeof value.activeFolderPath === 'string' && value.activeFolderPath.trim().length > 0
+      ? value.activeFolderPath
+      : null
   }
+}
+
+function isPathWithin(rootPath: string, candidatePath: string): boolean {
+  const relativePath = relative(rootPath, candidatePath)
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath))
 }
 
 function registerMediaProtocol(): void {
@@ -268,8 +405,19 @@ app.whenReady().then(async () => {
     (filePath) => allowedSourceFiles.delete(normalizeForComparison(filePath))
   )
   cleanupIpc.register()
-  transformIpc = new TransformIpcController(catalogWorker, thumbnailScheduler)
+  transformIpc = new TransformIpcController(
+    catalogWorker,
+    thumbnailScheduler,
+    (filePath) => allowedSourceFiles.has(normalizeForComparison(filePath))
+  )
   transformIpc.register()
+  organizeIpc = new OrganizeIpcController(catalogWorker)
+  organizeIpc.register()
+  tagsIpc = new TagsIpcController(
+    catalogWorker,
+    (filePath) => allowedSourceFiles.has(normalizeForComparison(filePath))
+  )
+  tagsIpc.register()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -289,14 +437,20 @@ app.on('before-quit', (event) => {
   ipcMain.removeHandler('select-folder')
   ipcMain.removeHandler('scan-directory')
   ipcMain.removeHandler('query-catalog')
+  ipcMain.removeHandler('get-folder-tree')
   ipcMain.removeAllListeners('visible-media-ids')
   cleanupIpc?.shutdown()
   transformIpc?.shutdown()
-  void Promise.all([
-    catalogWorker.shutdown(),
-    thumbnailScheduler.shutdown(),
-    duplicateIpc?.shutdown()
-  ]).finally(() => {
+  organizeIpc?.shutdown()
+  tagsIpc?.shutdown()
+  void (async () => {
+    await Promise.all([
+      thumbnailScheduler.shutdown(),
+      duplicateIpc?.shutdown()
+    ])
+    await drainMetadataUpdates()
+    await catalogWorker.shutdown()
+  })().finally(() => {
     shutdownFinished = true
     app.quit()
   })
