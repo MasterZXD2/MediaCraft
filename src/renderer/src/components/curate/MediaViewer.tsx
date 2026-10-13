@@ -24,7 +24,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
 import { useViewerKeys } from '@/hooks/useViewerKeys'
-import { createMediaUrl, selectActiveMediaIds, useMediaStore } from '@/store/mediaStore'
+import { createMediaUrl, selectActiveMediaIds, useMediaStore, type MediaFileData } from '@/store/mediaStore'
 
 export function MediaViewer(): JSX.Element | null {
   const viewingId = useMediaStore((state) => state.viewingId)
@@ -67,7 +67,7 @@ export function MediaViewer(): JSX.Element | null {
   const currentIndex = viewingId ? activeIds.indexOf(viewingId) : -1
   const canNavigate = activeIds.length > 1
 
-  useViewerKeys(viewingId !== null)
+  useViewerKeys(viewingId !== null && !!file && file.type !== 'pdf')
 
   useEffect(() => {
     setMediaFailed(false)
@@ -118,13 +118,13 @@ export function MediaViewer(): JSX.Element | null {
   }, [])
 
   useEffect(() => {
-    if (!viewingId) return
+    if (!viewingId || file?.type === 'pdf') return
     const previouslyFocused = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null
     dialogRef.current?.focus()
     return () => previouslyFocused?.focus()
-  }, [viewingId])
+  }, [viewingId, file?.type])
 
   useEffect(() => {
     if (viewingId && !file) closeViewer()
@@ -696,7 +696,7 @@ export function MediaViewer(): JSX.Element | null {
     setPreviewFlipVertical(false)
   }
 
-  if (!viewingId || !file) return null
+  if (!viewingId || !file || file.type === 'pdf') return null
 
   const hasPendingImageChanges = previewRotate % 360 !== 0 || previewFlipHorizontal || previewFlipVertical
 
@@ -1407,7 +1407,7 @@ function formatBytes(bytes: number): string {
 }
 
 function formatViewerMetadata(file: {
-  type: 'image' | 'video'
+  type: MediaFileData['type']
   width: number | null
   height: number | null
   size: number

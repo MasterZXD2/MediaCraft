@@ -576,6 +576,7 @@ function getMediaType(filePath: string): MediaType | null {
   const extension = extname(filePath).toLowerCase()
   if (IMAGE_EXTENSIONS.has(extension)) return 'image'
   if (VIDEO_EXTENSIONS.has(extension)) return 'video'
+  if (extension === '.pdf') return 'pdf'
   return null
 }
 

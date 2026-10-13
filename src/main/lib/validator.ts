@@ -1,7 +1,9 @@
 import { extname } from 'node:path'
 import sharp from 'sharp'
 import type { MediaType, ValidationFlagReason } from '../../shared/media'
+import { MAX_PDF_SOURCE_BYTES, PdfProcessingError } from '../../shared/pdf'
 import { FfmpegError, probeVideo } from './ffmpeg'
+import { probePdf } from './pdf'
 
 const MINIMUM_IMAGE_EDGE = 512
 const MINIMUM_ASPECT_RATIO = 1 / 3
@@ -27,6 +29,17 @@ export async function validateMedia(
   input: ValidationInput
 ): Promise<MediaValidationResult> {
   if (input.sizeBytes <= 0) return corruptResult()
+  if (type === 'pdf') {
+    if (input.sizeBytes > MAX_PDF_SOURCE_BYTES) return unverifiedPdfResult()
+    try {
+      const metadata = await probePdf(sourcePath, input.signal)
+      return { width: metadata.width, height: metadata.height, duration: null, fps: null, flagReason: null }
+    } catch (error) {
+      if (input.signal?.aborted) throw error
+      return error instanceof PdfProcessingError && error.reason === 'corrupt'
+        ? corruptResult() : unverifiedPdfResult()
+    }
+  }
   return type === 'image'
     ? validateImage(sourcePath)
     : validateVideo(sourcePath, input.signal)
@@ -108,4 +121,8 @@ function corruptResult(): MediaValidationResult {
     fps: null,
     flagReason: 'CORRUPT'
   }
+}
+
+function unverifiedPdfResult(): MediaValidationResult {
+  return { width: null, height: null, duration: null, fps: null, flagReason: null }
 }

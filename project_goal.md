@@ -36,11 +36,17 @@ MediaCraft is a high-performance, offline-first desktop application for local me
 
 Scan a root folder and build a catalog of all media files.
 
-- Recursive directory traversal for images (`.jpg`, `.jpeg`, `.png`, `.webp`) and videos (`.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.flv`, `.wmv`, `.m4v`)
+- Recursive directory traversal for images (`.jpg`, `.jpeg`, `.png`, `.webp`), videos (`.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.flv`, `.wmv`, `.m4v`), and PDF documents (`.pdf`)
 - Extract per-file metadata: path, dimensions, file size, duration (video), fps (video)
 - Results cached in SQLite for instant re-load
 - Smart Filters in the left sidebar: filter by status (valid/flagged/duplicate), media type (image/video), or presence in duplicate groups
 - Virtualized grid view in the main area for large collections (thousands of files)
+
+**PDF painting:**
+- PDFs appear in All Media with a first-page thumbnail; double-click opens a dedicated PDF Paint Editor.
+- Brush color, size, opacity, eraser, undo/redo, page navigation, zoom, and pan.
+- Save a painted PDF copy while preserving original page content and leaving the source untouched. The eraser affects only newly added paint.
+- PDF documents do not participate in image/video duplicate detection or conversion.
 
 ### 2. Clean Up
 

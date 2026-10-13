@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent } from 'react'
-import { FileImage, Film, FolderOutput, LoaderCircle } from 'lucide-react'
+import { FileImage, FileText, Film, FolderOutput, LoaderCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -17,6 +17,7 @@ import type {
   VideoCodec,
   VideoPreset
 } from '../../../../shared/transform'
+import type { PdfConversionOptions } from '../../../../shared/pdf'
 
 interface TransformModalProps {
   open: boolean
@@ -30,18 +31,23 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
   const isStarting = useMediaStore((state) => state.isTransformStarting)
   const transformError = useMediaStore((state) => state.transformError)
   const startTransform = useMediaStore((state) => state.startTransform)
+  const startPdfTransform = useMediaStore((state) => state.startPdfTransform)
   const selection = useMemo(() => {
     const state = useMediaStore.getState()
     let images = 0
     let videos = 0
+    let pdfs = 0
     for (const id of selectedIds) {
       const file = state.byId[id]
       if (file?.status !== 'active') continue
       if (file.type === 'image') images++
-      else videos++
+      else if (file.type === 'video') videos++
+      else if (file.type === 'pdf') pdfs++
     }
-    return { images, videos, total: images + videos }
+    return { images, videos, pdfs, total: images + videos + pdfs }
   }, [selectedIds])
+  const pdfOnly = selection.pdfs > 0 && selection.images === 0 && selection.videos === 0
+  const mixedMedia = selection.pdfs > 0 && !pdfOnly
 
   const [imageMode, setImageMode] = useState<ImageResizeMode>('long_edge')
   const [longEdge, setLongEdge] = useState(2048)
@@ -56,9 +62,19 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
   const [videoCrf, setVideoCrf] = useState(23)
   const [videoPreset, setVideoPreset] = useState<VideoPreset>('medium')
   const [skipUpscale, setSkipUpscale] = useState(true)
+  const [pdfFormat, setPdfFormat] = useState<PdfConversionOptions['format']>('png')
+  const [pdfDpi, setPdfDpi] = useState(150)
+  const [pdfQuality, setPdfQuality] = useState(85)
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault()
+    if (pdfOnly) {
+      const options: PdfConversionOptions = { format: pdfFormat, dpi: pdfDpi, quality: pdfQuality }
+      if (await startPdfTransform(options)) onOpenChange(false)
+      return
+    }
+    if (mixedMedia) return
+
     const image = imageMode === 'long_edge'
       ? {
           mode: 'long_edge' as const,
@@ -104,7 +120,36 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
         </DialogHeader>
 
         <form onSubmit={(event) => void submit(event)} className="space-y-5">
-          {selection.images > 0 && (
+          {mixedMedia && (
+            <p className="text-xs text-destructive" role="alert">
+              Select PDFs separately from images and videos. PDF conversion creates one image per page.
+            </p>
+          )}
+          {pdfOnly && (
+            <section className="border-t border-border pt-4">
+              <SectionHeading icon={FileText} title="PDF to Images" count={selection.pdfs} />
+              <p className="mt-2 text-xs text-muted-foreground">
+                Each page is rendered to a new image. Your original PDF is preserved.
+              </p>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <Field label="Image format">
+                  <Select value={pdfFormat} onChange={(value) => setPdfFormat(value as PdfConversionOptions['format'])}>
+                    <option value="png">PNG (lossless)</option>
+                    <option value="jpeg">JPEG (smaller files)</option>
+                  </Select>
+                </Field>
+                <Field label="Resolution (DPI)">
+                  <NumberInput value={pdfDpi} min={36} max={600} onChange={setPdfDpi} />
+                </Field>
+                {pdfFormat === 'jpeg' && (
+                  <Field label="JPEG quality">
+                    <NumberInput value={pdfQuality} min={1} max={100} onChange={setPdfQuality} />
+                  </Field>
+                )}
+              </div>
+            </section>
+          )}
+          {!pdfOnly && selection.images > 0 && (
             <section className="border-t border-border pt-4">
               <SectionHeading
                 icon={FileImage}
@@ -161,7 +206,7 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
             </section>
           )}
 
-          {selection.videos > 0 && (
+          {!pdfOnly && selection.videos > 0 && (
             <section className="border-t border-border pt-4">
               <SectionHeading icon={Film} title="Video Settings" count={selection.videos} />
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
@@ -237,7 +282,7 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
               </div>
             </section>
           )}
-          {(((selection.videos > 0 && videoMode === 'encode') || (selection.images > 0 && imageMode === 'long_edge')) && (
+          {!pdfOnly && (((selection.videos > 0 && videoMode === 'encode') || (selection.images > 0 && imageMode === 'long_edge')) && (
             <label className="flex items-center gap-2.5 border-t border-border pt-4 text-xs text-muted-foreground">
               <input
                 type="checkbox"
@@ -255,11 +300,11 @@ export function TransformModal({ open, onOpenChange }: TransformModalProps): JSX
             <Button type="button" variant="outline" disabled={isStarting} onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" className="gap-2" disabled={selection.total === 0 || isStarting}>
+            <Button type="submit" className="gap-2" disabled={selection.total === 0 || mixedMedia || isStarting}>
               {isStarting
                 ? <LoaderCircle className="h-4 w-4 animate-spin" />
                 : <FolderOutput className="h-4 w-4" />}
-              {isStarting ? 'Starting...' : 'Select Output Folder & Start'}
+              {isStarting ? 'Starting...' : pdfOnly ? 'Select Output Folder & Convert' : 'Select Output Folder & Start'}
             </Button>
           </div>
         </form>

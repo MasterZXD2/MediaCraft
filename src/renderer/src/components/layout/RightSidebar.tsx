@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
   AlertTriangle,
   Archive,
+  Brush,
   Check,
   FileImage,
+  FileText,
   Film,
   LoaderCircle,
   Plus,
@@ -415,7 +417,7 @@ function AggregateSelection({ count, totalSize }: { count: number; totalSize: nu
 }
 
 function SelectedMediaInspector({ file }: { file: MediaFileData }): JSX.Element {
-  const Icon = file.type === 'video' ? Film : FileImage
+  const Icon = file.type === 'pdf' ? FileText : file.type === 'video' ? Film : FileImage
 
   return (
     <>
@@ -447,9 +449,9 @@ function SelectedMediaInspector({ file }: { file: MediaFileData }): JSX.Element 
       )}
 
       <dl className="mt-4 space-y-2.5">
-        <MetadataRow label="Type" value={file.type === 'image' ? 'Image' : 'Video'} />
+        <MetadataRow label="Type" value={file.type === 'pdf' ? 'PDF document' : file.type === 'image' ? 'Image' : 'Video'} />
         <MetadataRow label="File size" value={formatBytes(file.size)} />
-        <MetadataRow label="Resolution" value={formatResolution(file)} />
+        {file.type !== 'pdf' && <MetadataRow label="Resolution" value={formatResolution(file)} />}
         {file.type === 'video' && (
           <>
             <MetadataRow
@@ -608,6 +610,7 @@ function NormalActions({
   const error = useMediaStore((state) => state.cleanupError)
   const transformError = useMediaStore((state) => state.transformError)
   const moveToTrash = useMediaStore((state) => state.moveToTrash)
+  const setViewingId = useMediaStore((state) => state.setViewingId)
   const activeSelectionCount = useMemo(() => {
     const state = useMediaStore.getState()
     return selectedIds.reduce(
@@ -615,18 +618,35 @@ function NormalActions({
       0
     )
   }, [selectedIds])
+  const hasSelectedPdf = useMemo(() => {
+    const state = useMediaStore.getState()
+    return selectedIds.some((id) => state.byId[id]?.type === 'pdf')
+  }, [selectedIds])
+  const hasMixedPdfSelection = useMemo(() => {
+    if (!hasSelectedPdf) return false
+    const state = useMediaStore.getState()
+    return selectedIds.some((id) => state.byId[id]?.type !== 'pdf')
+  }, [hasSelectedPdf, selectedIds])
 
   return (
     <section>
       <p className="mb-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Actions</p>
+      {selectedFile?.type === 'pdf' && (
+        <Button className="mb-3 w-full gap-2 [&_svg]:size-4" onClick={() => setViewingId(selectedFile.id)}>
+          <Brush data-icon="inline-start" />
+          Paint PDF
+        </Button>
+      )}
       <div className="grid grid-cols-2 gap-2">
         <Button
           variant="outline"
           size="sm"
           className="h-16 flex-col gap-1.5 bg-background/40"
-          disabled={activeSelectionCount === 0 || isTransformStarting || isTransforming}
+          disabled={activeSelectionCount === 0 || hasMixedPdfSelection || isTransformStarting || isTransforming}
           onClick={onOpenTransform}
-          title={activeSelectionCount > 0 ? `Convert ${activeSelectionCount} selected item${activeSelectionCount === 1 ? '' : 's'}` : 'Select media to convert'}
+          title={hasMixedPdfSelection
+            ? 'Select PDFs separately from images and videos.'
+            : activeSelectionCount > 0 ? `Convert ${activeSelectionCount} selected item${activeSelectionCount === 1 ? '' : 's'}` : 'Select media to convert'}
         >
           {isTransformStarting || isTransforming
             ? <LoaderCircle className="h-4 w-4 animate-spin text-primary" />

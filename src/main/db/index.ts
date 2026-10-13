@@ -21,7 +21,7 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
       folder_path TEXT NOT NULL,
       file_path TEXT NOT NULL UNIQUE,
       filename TEXT NOT NULL,
-      type TEXT NOT NULL CHECK (type IN ('image', 'video')),
+      type TEXT NOT NULL CHECK (type IN ('image', 'video', 'pdf')),
       size_bytes INTEGER NOT NULL,
       width INTEGER,
       height INTEGER,
@@ -55,6 +55,8 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
   if (!mediaFileColumns.some((column) => column.name === 'flag_reason')) {
     database.exec('ALTER TABLE media_files ADD COLUMN flag_reason TEXT;')
   }
+
+  migratePdfMediaType(database)
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS tags (
@@ -104,6 +106,43 @@ export function initializeDatabase(databasePath: string): BetterSqlite3.Database
   `)
 
   return database
+}
+
+function migratePdfMediaType(db: BetterSqlite3.Database): void {
+  const { sql } = db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'media_files'"
+  ).get() as { sql: string }
+  const legacyTypeCheck = /CHECK\s*\(\s*type\s+IN\s*\(\s*'image'\s*,\s*'video'\s*\)\s*\)/i
+  if (!legacyTypeCheck.test(sql)) return
+
+  const schemaObjects = db.prepare(`
+    SELECT sql FROM sqlite_schema
+    WHERE tbl_name = 'media_files' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+  `).all() as Array<{ sql: string }>
+  const columns = (db.pragma('table_info(media_files)') as Array<{ name: string }>)
+    .map(({ name }) => `"${name.replaceAll('"', '""')}"`).join(', ')
+  const migratedSchema = sql
+    .replace(/\bmedia_files\b/, 'media_files_pdf_migration')
+    .replace(legacyTypeCheck, "CHECK (type IN ('image', 'video', 'pdf'))")
+
+  // Disable cascading deletes only during the atomic table replacement; file IDs stay unchanged.
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.transaction(() => {
+      db.exec(migratedSchema)
+      db.exec(`
+        INSERT INTO media_files_pdf_migration (${columns}) SELECT ${columns} FROM media_files;
+        DROP TABLE media_files;
+        ALTER TABLE media_files_pdf_migration RENAME TO media_files;
+      `)
+      for (const object of schemaObjects) db.exec(object.sql)
+      if ((db.pragma('foreign_key_check') as unknown[]).length > 0) {
+        throw new Error('PDF catalog migration failed foreign-key validation.')
+      }
+    })()
+  } finally {
+    db.pragma('foreign_keys = ON')
+  }
 }
 
 export function getDatabase(): BetterSqlite3.Database {

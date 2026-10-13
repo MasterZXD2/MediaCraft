@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import sharp from 'sharp'
 import type { MediaType } from '../../shared/media'
 import { extractVideoFrame, FfmpegError } from './ffmpeg'
+import { renderPdfThumbnail } from './pdf'
 
 let cacheDirectory: string | null = null
 
@@ -67,6 +68,8 @@ export async function generateThumbnail(
         cachePermanentFailure = isSharpDecodeFailure(error)
         throw error
       }
+    } else if (type === 'pdf') {
+      await renderPdfThumbnail(absoluteSourcePath, temporaryPath, options.signal)
     } else {
       try {
         await extractVideoFrame(absoluteSourcePath, temporaryPath, 1, {

@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell, type WebContents } from 'electron'
+import { statSync } from 'node:fs'
 import { join, normalize, relative, resolve, isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { CatalogWorkerCoordinator } from './ipc/scanner'
@@ -7,6 +8,8 @@ import { CleanupIpcController } from './ipc/cleanup'
 import { TransformIpcController } from './ipc/transform'
 import { OrganizeIpcController } from './ipc/organize'
 import { TagsIpcController } from './ipc/tags'
+import { PdfIpcController } from './ipc/pdf'
+import { shutdownPdfWorker } from './lib/pdf'
 import { PriorityMediaScheduler } from './lib/scheduler'
 import { initializeThumbnailCache } from './lib/thumbnail'
 import type { CatalogQueryInput, CatalogSortBy, CatalogStreamEvent } from '../shared/catalog'
@@ -31,13 +34,36 @@ let cleanupIpc: CleanupIpcController | null = null
 let transformIpc: TransformIpcController | null = null
 let organizeIpc: OrganizeIpcController | null = null
 let tagsIpc: TagsIpcController | null = null
+let pdfIpc: PdfIpcController | null = null
 let shutdownStarted = false
 let shutdownFinished = false
+
+function configureBundledFfmpeg(): void {
+  if (!app.isPackaged) return
+
+  const ffmpegDirectory = join(process.resourcesPath, 'ffmpeg')
+  const ffmpegPath = join(ffmpegDirectory, 'ffmpeg.exe')
+  const ffprobePath = join(ffmpegDirectory, 'ffprobe.exe')
+  const missing = [ffmpegPath, ffprobePath].filter((filePath) => {
+    try {
+      return !statSync(filePath).isFile()
+    } catch {
+      return true
+    }
+  })
+
+  if (missing.length > 0) {
+    throw new Error(`Bundled FFmpeg is missing: ${missing.join(', ')}`)
+  }
+
+  process.env.FFMPEG_PATH = ffmpegPath
+  process.env.FFPROBE_PATH = ffprobePath
+}
 
 protocol.registerSchemesAsPrivileged([
   {
     scheme: MEDIA_PROTOCOL,
-    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true }
   }
 ])
 
@@ -326,7 +352,7 @@ function isPathWithin(rootPath: string, candidatePath: string): boolean {
 }
 
 function registerMediaProtocol(): void {
-  protocol.handle(MEDIA_PROTOCOL, (request) => {
+  protocol.handle(MEDIA_PROTOCOL, async (request) => {
     try {
       const requestUrl = new URL(request.url)
       if (requestUrl.hostname !== 'local') return new Response('Not found', { status: 404 })
@@ -337,7 +363,12 @@ function registerMediaProtocol(): void {
         return new Response('Forbidden', { status: 403 })
       }
 
-      return net.fetch(pathToFileURL(filePath).toString())
+      const response = await net.fetch(pathToFileURL(filePath).toString())
+      const headers = new Headers(response.headers)
+      headers.set('Access-Control-Allow-Origin', process.env.ELECTRON_RENDERER_URL
+        ? new URL(process.env.ELECTRON_RENDERER_URL).origin
+        : 'null')
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
     } catch {
       return new Response('Bad request', { status: 400 })
     }
@@ -379,6 +410,7 @@ app.whenReady().then(async () => {
   const thumbnailCacheDirectory = join(app.getPath('userData'), 'MediaCraft_Thumbnails')
 
   try {
+    configureBundledFfmpeg()
     catalogWorker = new CatalogWorkerCoordinator(databasePath)
     await Promise.all([
       catalogWorker.ready(),
@@ -386,7 +418,7 @@ app.whenReady().then(async () => {
     ])
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    dialog.showErrorBox('MediaCraft could not start', `Catalog initialization failed: ${message}`)
+    dialog.showErrorBox('MediaCraft could not start', `Startup initialization failed: ${message}`)
     app.quit()
     return
   }
@@ -418,6 +450,11 @@ app.whenReady().then(async () => {
     (filePath) => allowedSourceFiles.has(normalizeForComparison(filePath))
   )
   tagsIpc.register()
+  pdfIpc = new PdfIpcController(
+    catalogWorker,
+    (filePath) => allowedSourceFiles.has(normalizeForComparison(filePath))
+  )
+  pdfIpc.register()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -443,11 +480,13 @@ app.on('before-quit', (event) => {
   transformIpc?.shutdown()
   organizeIpc?.shutdown()
   tagsIpc?.shutdown()
+  pdfIpc?.shutdown()
   void (async () => {
     await Promise.all([
       thumbnailScheduler.shutdown(),
       duplicateIpc?.shutdown()
     ])
+    await shutdownPdfWorker()
     await drainMetadataUpdates()
     await catalogWorker.shutdown()
   })().finally(() => {

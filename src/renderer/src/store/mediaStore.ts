@@ -6,6 +6,7 @@ import type {
   TransformBatchOptions,
   TransformProgressData
 } from '../../../shared/transform'
+import type { PdfConversionOptions } from '../../../shared/pdf'
 import type { TagRecord } from '../../../shared/tags'
 
 export type MediaFilter = 'all' | 'images' | 'videos' | 'duplicates' | 'flagged' | 'trash'
@@ -125,6 +126,7 @@ export interface MediaState extends NormalizedMedia {
   renameAvailableTag: (tagId: number, newName: string) => Promise<boolean>
   loadAvailableTags: () => Promise<void>
   startTransform: (options: TransformBatchOptions) => Promise<boolean>
+  startPdfTransform: (options: PdfConversionOptions) => Promise<boolean>
   cancelTransform: () => Promise<void>
   loadDirectory: (path: string) => Promise<void>
 }
@@ -211,7 +213,7 @@ function normalizeMediaFiles(
     normalized.totalSize += media.size
 
     if (media.type === 'image') normalized.imageIds.push(media.id)
-    else normalized.videoIds.push(media.id)
+    else if (media.type === 'video') normalized.videoIds.push(media.id)
     if (media.duplicateGroupId) normalized.duplicateIds.push(media.id)
     if (media.flagReason) normalized.flaggedIds.push(media.id)
   }
@@ -1204,6 +1206,10 @@ export const useMediaStore = create<MediaState>((set, get) => ({
       set({ transformError: 'Select at least one active media item.' })
       return false
     }
+    if (fileIds.some((id) => state.byId[id].type === 'pdf')) {
+      set({ transformError: 'PDF files use the PDF Paint Editor or PDF-to-image conversion. Select only images or videos for this transform.' })
+      return false
+    }
 
     set({ isTransformStarting: true, transformError: null })
     try {
@@ -1240,6 +1246,58 @@ export const useMediaStore = create<MediaState>((set, get) => ({
         isTransformStarting: false,
         isTransforming: false,
         transformError: error instanceof Error ? error.message : 'Unable to start transformation.'
+      })
+      return false
+    }
+  },
+  startPdfTransform: async (options) => {
+    const state = get()
+    if (state.isTransformStarting || state.isTransforming) return false
+    const fileIds = Array.from(state.selectedIds).filter((id) => state.byId[id]?.status === 'active')
+    if (fileIds.length === 0) {
+      set({ transformError: 'Select at least one active PDF file.' })
+      return false
+    }
+    if (fileIds.some((id) => state.byId[id]?.type !== 'pdf')) {
+      set({ transformError: 'Select only PDF files for PDF-to-image conversion.' })
+      return false
+    }
+
+    set({ isTransformStarting: true, transformError: null })
+    try {
+      const outputDirectory = await window.api.selectTransformOutputDirectory()
+      if (!outputDirectory) {
+        set({ isTransformStarting: false })
+        return false
+      }
+
+      const accepted = await window.api.convertPdfToImages({ fileIds, options, outputDirectory })
+      transformProgressById.clear()
+      terminalTransformIds.clear()
+      transformProgressSum = 0
+      set({
+        isTransformStarting: false,
+        isTransforming: accepted.accepted > 0,
+        transformBatchId: accepted.batchId,
+        transformingIds: new Set(fileIds),
+        transformProgress: 0,
+        transformCompleted: 0,
+        transformTotal: accepted.accepted,
+        transformError: null
+      })
+
+      const buffered = bufferedTransformEvents.get(accepted.batchId)
+      bufferedTransformEvents.delete(accepted.batchId)
+      if (buffered) {
+        for (const progress of buffered.values()) applyTransformProgress(progress)
+      }
+      trimBufferedTransformEvents(accepted.batchId)
+      return true
+    } catch (error) {
+      set({
+        isTransformStarting: false,
+        isTransforming: false,
+        transformError: error instanceof Error ? error.message : 'Unable to start PDF conversion.'
       })
       return false
     }
@@ -1617,14 +1675,14 @@ window.api.onCatalogEvent((event) => {
             if (existing.type === 'image') {
               removeId(state.imageIds, id)
               totalImages--
-            } else {
+            } else if (existing.type === 'video') {
               removeId(state.videoIds, id)
               totalVideos--
             }
             if (media.type === 'image') {
               state.imageIds.push(id)
               totalImages++
-            } else {
+            } else if (media.type === 'video') {
               state.videoIds.push(id)
               totalVideos++
             }
@@ -1656,7 +1714,7 @@ window.api.onCatalogEvent((event) => {
           if (media.type === 'image') {
             state.imageIds.push(id)
             totalImages++
-          } else {
+          } else if (media.type === 'video') {
             state.videoIds.push(id)
             totalVideos++
           }

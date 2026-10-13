@@ -5,6 +5,7 @@ import {
   Check,
   Expand,
   FileImage,
+  FileText,
   Film,
   LoaderCircle,
   Trash2,
@@ -18,6 +19,7 @@ import {
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 import { useMediaStore, type MediaViewMode } from '@/store/mediaStore'
+import { cn } from '@/lib/utils'
 
 interface MediaCardProps {
   id: string
@@ -41,18 +43,27 @@ export const MediaCard = memo(function MediaCard({ id, viewMode }: MediaCardProp
   const setExportPanelOpen = useMediaStore((state) => state.setExportPanelOpen)
   const moveSelectionToTrash = useMediaStore((state) => state.moveSelectionToTrash)
   const [previewFailed, setPreviewFailed] = useState(false)
+  const [canConvertSelection, setCanConvertSelection] = useState(false)
 
   useEffect(() => setPreviewFailed(false), [file?.thumbnailUrl])
 
   if (!file) return null
 
-  const Icon = file.type === 'video' ? Film : FileImage
+  const Icon = file.type === 'pdf' ? FileText : file.type === 'video' ? Film : FileImage
   const groupColor = isDuplicateView && file.duplicateGroupId
     ? colorForGroup(file.duplicateGroupId)
     : null
 
   return (
-    <ContextMenu>
+    <ContextMenu onOpenChange={(open) => {
+      if (!open) return
+      if (!useMediaStore.getState().selectedIds.has(id)) selectMedia(id)
+      const state = useMediaStore.getState()
+      setCanConvertSelection(Array.from(state.selectedIds).every((selectedId) => {
+        const selected = state.byId[selectedId]
+        return selected?.status === 'active' && selected.type !== 'pdf'
+      }))
+    }}>
       <ContextMenuTrigger asChild>
         <article
           role="button"
@@ -94,7 +105,10 @@ export const MediaCard = memo(function MediaCard({ id, viewMode }: MediaCardProp
             alt={file.filename}
             loading="lazy"
             decoding="async"
-            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+            className={cn(
+              'h-full w-full transition-transform duration-300 group-hover:scale-[1.03]',
+              file.type === 'pdf' ? 'object-contain' : 'object-cover'
+            )}
             onError={() => setPreviewFailed(true)}
           />
         ) : (
@@ -158,11 +172,11 @@ export const MediaCard = memo(function MediaCard({ id, viewMode }: MediaCardProp
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => setViewingId(id)}>
           <Expand className="h-3.5 w-3.5" />
-          View Fullscreen
+          {file.type === 'pdf' ? 'Open PDF Paint Editor' : 'View Fullscreen'}
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
-          disabled={file.status !== 'active'}
+          disabled={file.status !== 'active' || !canConvertSelection}
           onSelect={() => setTransformModalOpen(true)}
         >
           <WandSparkles className="h-3.5 w-3.5 text-primary" />

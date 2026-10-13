@@ -1,6 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { CatalogQueryInput, CatalogScanRequest, CatalogStreamEvent } from '../shared/catalog'
 import type {
+  PdfConversionInput,
+  SavePdfPaintInput
+} from '../shared/pdf'
+import type {
   MediaMetadataReadyData,
   ScanProgressData,
   ThumbnailReadyData
@@ -50,6 +54,7 @@ export interface MediaCraftApi {
   emptyTrash: (datasetRoot: string) => Promise<EmptyTrashResult>
   selectTransformOutputDirectory: () => Promise<string | null>
   transformMedia: (input: TransformMediaInput) => Promise<TransformBatchAccepted>
+  convertPdfToImages: (input: PdfConversionInput) => Promise<TransformBatchAccepted>
   cancelTransform: (batchId: string) => Promise<boolean>
   onTransformProgress: (callback: (data: TransformProgressData) => void) => void
   extractVideoThumbnails: (videoPath: string, count: number) => Promise<string[]>
@@ -62,6 +67,7 @@ export interface MediaCraftApi {
   getAllTags: () => Promise<TagRecord[]>
   deleteGlobalTag: (tagId: number) => Promise<boolean>
   renameGlobalTag: (input: GlobalTagRenameInput) => Promise<TagRecord>
+  savePdfPaint: (input: SavePdfPaintInput) => Promise<string | null>
 }
 
 const api: MediaCraftApi = {
@@ -101,6 +107,7 @@ const api: MediaCraftApi = {
   emptyTrash: (datasetRoot) => ipcRenderer.invoke('empty-trash', datasetRoot),
   selectTransformOutputDirectory: () => ipcRenderer.invoke('select-transform-output-directory'),
   transformMedia: (input) => ipcRenderer.invoke('transform-media', input),
+  convertPdfToImages: (input) => ipcRenderer.invoke('convert-pdf-to-images', input),
   cancelTransform: (batchId) => ipcRenderer.invoke('cancel-transform', batchId),
   onTransformProgress: (callback) => {
     ipcRenderer.on('transform-progress', (_event, data: TransformProgressData) => callback(data))
@@ -116,7 +123,8 @@ const api: MediaCraftApi = {
   removeTag: (input) => ipcRenderer.invoke('remove-tag', input),
   getAllTags: () => ipcRenderer.invoke('get-all-tags'),
   deleteGlobalTag: (tagId) => ipcRenderer.invoke('delete-global-tag', tagId),
-  renameGlobalTag: (input) => ipcRenderer.invoke('rename-global-tag', input)
+  renameGlobalTag: (input) => ipcRenderer.invoke('rename-global-tag', input),
+  savePdfPaint: (input) => ipcRenderer.invoke('save-pdf-paint', input)
 }
 
 contextBridge.exposeInMainWorld('api', api)

@@ -251,7 +251,7 @@ export class PriorityMediaScheduler {
     activeJob.controller = controller
     activeJob.promise = this.run(job, controller)
     this.active.set(this.keyFor(job), activeJob)
-    if (job.type === 'image') this.runningImages++
+    if (this.laneFor(job.type) === 'image') this.runningImages++
     else this.runningVideos++
   }
 
@@ -277,7 +277,7 @@ export class PriorityMediaScheduler {
       error = controller.signal.aborted ? new MediaJobCancelledError() : caughtError
     } finally {
       this.active.delete(this.keyFor(job))
-      if (job.type === 'image') this.runningImages--
+      if (this.laneFor(job.type) === 'image') this.runningImages--
       else this.runningVideos--
 
       if (job.kind === 'thumbnail') {
@@ -323,12 +323,12 @@ export class PriorityMediaScheduler {
   }
 
   private laneFor(type: MediaType): JobLane {
-    return type === 'image' ? 'image' : 'video'
+    return type === 'video' ? 'video' : 'image'
   }
 }
 
 function reusableValidation(job: ThumbnailJob): MediaValidationResult | null {
-  if (job.flagReason !== null) {
+  if (job.flagReason !== null && job.type !== 'pdf') {
     return {
       width: job.width,
       height: job.height,
@@ -337,7 +337,7 @@ function reusableValidation(job: ThumbnailJob): MediaValidationResult | null {
       flagReason: job.flagReason
     }
   }
-  if (job.type === 'image' && job.width !== null && job.height !== null) {
+  if ((job.type === 'image' || job.type === 'pdf') && job.width !== null && job.height !== null) {
     return {
       width: job.width,
       height: job.height,

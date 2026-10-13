@@ -1,4 +1,4 @@
-export type MediaType = 'image' | 'video'
+export type MediaType = 'image' | 'video' | 'pdf'
 export type ValidationFlagReason = 'CORRUPT' | 'TOO_SMALL' | 'BAD_ASPECT' | 'INVALID_METADATA'
 
 export interface MediaFile {

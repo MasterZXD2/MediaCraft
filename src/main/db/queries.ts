@@ -259,6 +259,7 @@ function prepareStatements() {
            media.duration, media.last_modified, media.perceptual_hash
     FROM media_files AS media
     WHERE media.status = 'active'
+      AND media.type IN ('image', 'video')
       AND (
         media.folder_path = @folder_path
         OR media.folder_path LIKE @folder_prefix ESCAPE '!'
@@ -311,6 +312,7 @@ function prepareStatements() {
     WHERE file_path = @file_path
       AND last_modified = @expected_last_modified
       AND status = 'active'
+      AND type IN ('image', 'video')
   `)
   const updateMediaMetadata = db.prepare(`
     UPDATE media_files
@@ -327,6 +329,7 @@ function prepareStatements() {
     UPDATE media_files
     SET duplicate_group_id = NULL
     WHERE status = 'active'
+      AND type IN ('image', 'video')
       AND (
         folder_path = @scope_folder_path
         OR folder_path LIKE @scope_folder_prefix ESCAPE '!'
@@ -338,6 +341,7 @@ function prepareStatements() {
     WHERE file_path = @file_path
       AND last_modified = @expected_last_modified
       AND status = 'active'
+      AND type IN ('image', 'video')
   `)
   const markTrash = db.prepare(`
     UPDATE media_files

@@ -7,12 +7,16 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
+    "prepare:ffmpeg": "node ./scripts/prepare-ffmpeg.cjs",
+    "package:win": "npm run build && npm run prepare:ffmpeg && electron-builder --win nsis portable",
+    "package:win:dir": "npm run build && npm run prepare:ffmpeg && electron-builder --win dir",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "postinstall": "node ./node_modules/electron/install.js && electron-rebuild -f -w better-sqlite3",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.11",
     "@radix-ui/react-accordion": "^1.2.11",
     "@radix-ui/react-context-menu": "^2.3.7",
     "@radix-ui/react-dialog": "^1.1.21",
@@ -26,6 +30,8 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.4.299",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-image-crop": "^11.1.2",
@@ -42,11 +48,66 @@
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^3.0.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.mediacraft.app",
+    "productName": "MediaCraft",
+    "asar": false,
+    "files": [
+      "out/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "ffmpeg.exe",
+          "ffprobe.exe",
+          "LICENSE*"
+        ]
+      }
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "MediaCraft-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MediaCraft",
+      "runAfterFinish": true
+    },
+    "portable": {
+      "artifactName": "MediaCraft-${version}-portable.${ext}"
+    }
   }
 }

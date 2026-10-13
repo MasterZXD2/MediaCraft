@@ -87,6 +87,11 @@ web_modules/
 .next
 out
 
+# Windows release artifacts and locally bundled FFmpeg binaries
+release/
+resources/ffmpeg/
+release-package-*.log
+
 # Nuxt.js build / generate output
 .nuxt
 dist

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { access, stat } from 'node:fs/promises'
+import { access, rm, stat } from 'node:fs/promises'
 import {
   basename,
   dirname,
@@ -23,6 +23,7 @@ import {
   transformImage,
   transformVideo
 } from '../lib/transformer'
+import { probePdf, rasterizePdfToImages } from '../lib/pdf'
 import { authorizedVideoPath } from '../lib/mediaAuthorization'
 import type {
   CatalogMediaReference,
@@ -36,6 +37,11 @@ import type {
   VideoTransformMode,
   VideoTransformOptions
 } from '../../shared/transform'
+import {
+  MAX_PDF_RASTER_PAGES,
+  parsePdfConversionInput,
+  type PdfConversionOptions
+} from '../../shared/pdf'
 
 const MAX_BATCH_SIZE = 5_000
 const MAX_IMAGE_DIMENSION = 16_384
@@ -123,6 +129,7 @@ export class TransformIpcController {
     })
 
     ipcMain.handle('transform-media', (event, input: unknown) => this.startBatch(event, input))
+    ipcMain.handle('convert-pdf-to-images', (event, input: unknown) => this.startPdfBatch(event, input))
     ipcMain.handle('cancel-transform', (event, batchId: unknown) => {
       if (typeof batchId !== 'string' || batchId.length === 0) return false
       const batch = this.activeBatches.get(batchId)
@@ -137,6 +144,7 @@ export class TransformIpcController {
     ipcMain.removeHandler('select-transform-output-directory')
     ipcMain.removeHandler('extract-video-thumbnails')
     ipcMain.removeHandler('transform-media')
+    ipcMain.removeHandler('convert-pdf-to-images')
     ipcMain.removeHandler('cancel-transform')
     for (const [batchId, batch] of this.activeBatches) {
       batch.sender.removeListener('destroyed', batch.onSenderDestroyed)
@@ -166,6 +174,9 @@ export class TransformIpcController {
     const references = await this.catalog.getMediaReferences(fileIds)
     if (references.length !== fileIds.length) {
       throw new Error('One or more selected media files are missing or no longer active.')
+    }
+    if (references.some((reference) => reference.type === 'pdf')) {
+      throw new Error('PDF documents must be edited with the PDF Paint Editor, not the media transformer.')
     }
     if (sender.isDestroyed()) throw new Error('The requesting window was closed.')
 
@@ -239,6 +250,125 @@ export class TransformIpcController {
     }
 
     return { batchId, accepted: references.length }
+  }
+
+  private async startPdfBatch(
+    event: IpcMainInvokeEvent,
+    untrustedInput: unknown
+  ): Promise<TransformBatchAccepted> {
+    const input = parsePdfConversionInput(untrustedInput)
+    const sender = event.sender
+    const outputDirectory = resolve(input.outputDirectory)
+    const senderOutputDirectories = this.authorizedOutputDirectories.get(sender.id)
+    if (!senderOutputDirectories?.has(normalizeForComparison(outputDirectory))) {
+      throw new Error('Choose the output directory with the folder picker before converting PDFs.')
+    }
+    const outputStats = await stat(outputDirectory).catch(() => null)
+    if (!outputStats?.isDirectory()) throw new Error('The PDF output directory is unavailable.')
+
+    const fileIds = deduplicateFileIds(input.fileIds)
+    const references = await this.catalog.getMediaReferences(fileIds)
+    if (references.length !== fileIds.length || references.some((reference) => reference.type !== 'pdf')) {
+      throw new Error('Select only active PDF files for PDF-to-image conversion.')
+    }
+    if (references.some((reference) => !this.isSourceAllowed(reference.filePath))) {
+      throw new Error('One or more PDFs are outside the selected dataset.')
+    }
+    if (sender.isDestroyed()) throw new Error('The requesting window was closed.')
+
+    const pageCounts = new Map<string, number>()
+    for (const reference of references) {
+      const metadata = await probePdf(reference.filePath)
+      if (!Number.isInteger(metadata.pageCount) || metadata.pageCount < 1 || metadata.pageCount > MAX_PDF_RASTER_PAGES) {
+        throw new Error(`The PDF ${reference.filename} exceeds the supported page limit.`)
+      }
+      pageCounts.set(reference.fileId, metadata.pageCount)
+    }
+    const outputs = await this.allocatePdfOutputs(references, pageCounts, input.options, outputDirectory)
+    const batchId = randomUUID()
+    const onSenderDestroyed = (): void => this.scheduler.cancelBackgroundGroup(batchId)
+    this.activeBatches.set(batchId, {
+      sender,
+      onSenderDestroyed,
+      pendingJobs: references.length
+    })
+    sender.once('destroyed', onSenderDestroyed)
+
+    for (const reference of references) {
+      const targetPaths = outputs.get(reference.fileId)
+      if (!targetPaths) continue
+      const progress = createProgressEmitter(sender, batchId, reference.fileId)
+      progress({ status: 'pending', progress: 0 })
+      const enqueued = this.scheduler.enqueueBackground({
+        jobId: `${batchId}:${reference.fileId}`,
+        groupId: batchId,
+        id: reference.fileId,
+        type: 'pdf',
+        execute: async (signal) => {
+          progress({ status: 'processing', progress: 0 })
+          await rasterizePdfToImages(reference.filePath, targetPaths, input.options, signal, (page, pageCount) => {
+            progress({ status: 'processing', progress: Math.min(100, Math.round(page / pageCount * 100)) })
+          })
+        },
+        onSettled: (error) => {
+          this.releaseReservedPaths(targetPaths)
+          if (error instanceof MediaJobCancelledError) {
+            void removeFiles(targetPaths)
+            progress({ status: 'cancelled', progress: 0 })
+          } else if (error) {
+            void removeFiles(targetPaths)
+            progress({ status: 'error', progress: 0, error: getErrorMessage(error) })
+          } else {
+            progress({ status: 'complete', progress: 100, outputPath: targetPaths[0] })
+          }
+          this.finishJob(batchId)
+        }
+      })
+      if (!enqueued) {
+        this.releaseReservedPaths(targetPaths)
+        void removeFiles(targetPaths)
+        progress({ status: 'error', progress: 0, error: 'The media scheduler rejected this PDF job.' })
+        this.finishJob(batchId)
+      }
+    }
+
+    return { batchId, accepted: references.length }
+  }
+
+  private async allocatePdfOutputs(
+    references: CatalogMediaReference[],
+    pageCounts: Map<string, number>,
+    options: PdfConversionOptions,
+    outputDirectory: string
+  ): Promise<Map<string, string[]>> {
+    const outputs = new Map<string, string[]>()
+    const allocatedPaths: string[] = []
+    const extension = options.format === 'jpeg' ? '.jpg' : '.png'
+    try {
+      for (const reference of references) {
+        const pageCount = pageCounts.get(reference.fileId)
+        if (!pageCount) throw new Error(`Could not determine the page count for ${reference.filename}.`)
+        const destinationDirectory = join(outputDirectory, safeSourceSubdirectory(reference))
+        const sourceExtension = extname(reference.filename)
+        const sourceStem = basename(reference.filename, sourceExtension)
+        const paths: string[] = []
+        for (let page = 1; page <= pageCount; page++) {
+          const basePath = join(destinationDirectory, `${sourceStem}_page-${String(page).padStart(3, '0')}${extension}`)
+          const path = await this.reserveAvailablePath(basePath)
+          paths.push(path)
+          allocatedPaths.push(path)
+        }
+        outputs.set(reference.fileId, paths)
+      }
+      return outputs
+    } catch (error) {
+      this.releaseReservedPaths(allocatedPaths)
+      throw error
+    }
+  }
+
+  private releaseReservedPaths(paths: string[]): void {
+    for (const path of paths) this.reservedOutputPaths.delete(normalizeForComparison(path))
   }
 
   private async allocateBatchOutputs(
@@ -526,4 +656,8 @@ function isMissingPathError(error: unknown): boolean {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function removeFiles(paths: readonly string[]): Promise<void> {
+  await Promise.all(paths.map((path) => rm(path, { force: true }).catch(() => undefined)))
 }
