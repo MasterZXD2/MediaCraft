@@ -81,6 +81,7 @@
       "buildResources": "resources"
     },
     "win": {
+      "icon": "resources/icon.ico",
       "target": [
         {
           "target": "nsis",
